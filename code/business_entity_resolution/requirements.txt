@@ -1,5 +1,16 @@
-pandas
-scikit-learn
-xgboost
-unidecode
-tqdm
+# Python 3.10. Versions pinned to the environment the results were produced with.
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+duckdb==1.5.5
+Unidecode==1.4.0
+tqdm==4.70.1
+
+# Matching models. The local env uses the CPU build of torch (2.14.0+cpu);
+# for a GPU install the CUDA wheel of the same version from download.pytorch.org.
+torch==2.14.0
+transformers==5.17.0
+tokenizers==0.23.2
+safetensors==0.8.0
+sentence-transformers==6.1.0
