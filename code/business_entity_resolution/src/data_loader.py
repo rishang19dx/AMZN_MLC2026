@@ -133,5 +133,39 @@ def create_validation_split(fraction=config.VAL_FRACTION, seed=config.SPLIT_SEED
     return counts
 
 
+def create_ce_train_split(fraction=0.05, seed='mlc26-ce'):
+    """
+    ce_train = a hash-sampled `fraction` of local_train's Source 1 (+ their
+    ground-truth rows) against ALL local_train targets, so blocking produces
+    realistic hard negatives. The target files are symlinks, not copies.
+    Disjoint from local_val and test by construction.
+    """
+    src, dst = config.split_paths('local_train'), config.split_paths('ce_train')
+    os.makedirs(dst['dir'], exist_ok=True)
+    keep = set()
+    with open(src['s1'], encoding='utf-8') as f, open(dst['s1'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        for line in f:
+            eid = line.split('\t', 1)[0]
+            if in_holdout(eid, fraction, seed):
+                keep.add(eid)
+                o.write(line)
+    with open(src['gt'], encoding='utf-8') as f, open(dst['gt'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        o.writelines(line for line in f if line.split('\t', 1)[0] in keep)
+    for key in ('s2', 's3'):
+        if os.path.lexists(dst[key]):
+            os.remove(dst[key])
+        os.symlink(os.path.relpath(src[key], dst['dir']), dst[key])
+    print(f'ce_train: {len(keep):,} Source 1 entities against all local_train targets -> {dst["dir"]}')
+
+
 if __name__ == '__main__':
-    create_validation_split()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--ce-train', action='store_true', help='also (only) build the cross-encoder training split')
+    args = ap.parse_args()
+    if args.ce_train:
+        create_ce_train_split()
+    else:
+        create_validation_split()

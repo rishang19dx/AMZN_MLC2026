@@ -1,5 +1,12 @@
 # Ensemble design (to implement on top of `match.py` v1)
 
+> **Revisions, 26 Sep 01:15 IST** (decided with Rishang; they override the sections below where they conflict):
+> 1. **Hardware:** this laptop (16 cores, 15 GB RAM) + one **Kaggle T4**. There is no 24 GB GPU, so §6's estimates are ~3–4× too optimistic for the GPU pieces.
+> 2. **One cross-encoder, not A/B** (§3.2). It is trained on the separate `ce_train` split (5% of `local_train` Source 1 against all `local_train` targets; `data_loader.py --ce-train`). Its scores on `local_val` and test are therefore out-of-sample by construction, so rules 1–2 hold with half the GPU time. Implemented in `src/cross_encoder.py` (export / train / score) and wired into `match.py` stage 2 (`ce`, `ce_s1_rank`, `ce_s1_gap`, `ce_t_margin`). The band rule uses out-of-fold `p1` on `local_val` (`oof_p1.npy`) and the final stage-1 model on test.
+> 3. **Qwen3-4B judge (§3.5, §4.5): only if time remains** after submissions 1–4.
+> 4. **Adoption rule (§5):** adopt a step when the public leaderboard improves **and** the out-of-fold `local_val` F0.5 does not fall. Leaderboard changes below 0.001 count as ties, broken by `local_val`. This guards against overfitting the public subset, since the private leaderboard decides the ranking.
+> 5. **Owner:** Claude builds submission 1, the cross-encoder, the noisy-channel matcher and the error analysis.
+
 Status: **agreed design, not yet implemented** (26 Sep 2026). `match.py` v1 already provides stage 1, stage 2, the one-Source-1-per-target assignment and expected-F0.5 decoding. This document specifies what the other members add, how they plug in, and the rules that keep every score honest. Evidence for each choice is in §7; broader background is in `FINDINGS.md`.
 
 ## 1. Structure

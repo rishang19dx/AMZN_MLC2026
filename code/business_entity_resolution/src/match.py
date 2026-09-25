@@ -153,6 +153,46 @@ def group_stats(code, p):
     return rank, top1[row_g], top2[row_g], gsum[row_g], gn50[row_g]
 
 
+CE_COLS = ['ce', 'ce_s1_rank', 'ce_s1_gap', 'ce_t_margin']
+
+
+def ce_features(split, s1_code, t_code):
+    """
+    Cross-encoder member (cross_encoder.py) as stage-2 columns, or None if the
+    split has no ce_scores.parquet. Rows outside the scored band get NaN.
+    Context mirrors context_features: rank / gap within the Source 1 list and
+    margin over the best competing Source 1 for the target (among scored rows).
+    """
+    path = os.path.join(config.CACHE_DIR, split, 'ce_scores.parquet')
+    if not os.path.exists(path):
+        return None
+    import duckdb
+    d = duckdb.sql(f"SELECT s1_idx, tg_idx, ce FROM read_parquet('{path}')").fetchnumpy()
+    n_tg = int(max(t_code.max(), np.asarray(d['tg_idx']).max())) + 1
+    row_key = pd.Index(s1_code * n_tg + t_code)
+    pos = row_key.get_indexer(np.asarray(d['s1_idx'], np.int64) * n_tg + np.asarray(d['tg_idx'], np.int64))
+    ok = pos >= 0
+    out = np.full((len(s1_code), len(CE_COLS)), np.nan, np.float32)
+    rows, ce = pos[ok], np.asarray(d['ce'], np.float32)[ok]
+    out[rows, 0] = ce
+    r, t1, _, _, _ = group_stats(s1_code[rows], ce)
+    out[rows, 1], out[rows, 2] = r, t1 - ce
+    r, t1, t2, _, _ = group_stats(t_code[rows], ce)
+    out[rows, 3] = ce - np.where(r == 1, t2, t1)
+    log(f'cross-encoder scores for {int(ok.sum()):,} rows ({split})')
+    return out
+
+
+def stage2_matrix(split, pairs_or_codes, X, p1):
+    """Base features + p1 context (+ cross-encoder columns when available)."""
+    s1_code, t_code = pairs_or_codes
+    parts = [X, context_features(s1_code, t_code, p1)]
+    ce = ce_features(split, s1_code, t_code)
+    if ce is not None:
+        parts.append(ce)
+    return np.hstack(parts), (CONTEXT + (CE_COLS if ce is not None else []))
+
+
 def context_features(s1_code, t_code, p1):
     """Stage-2 context, columns in CONTEXT order."""
     r, t1, t2, s, n50 = group_stats(s1_code, p1)
@@ -322,8 +362,9 @@ def run_cv(split):
 
     log('stage 1 (pair features)')
     p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
-    X2 = np.hstack([pairs.X, context_features(pairs.s1_code, pairs.t_code, p1)])
-    log('stage 2 (+ list and competition context)')
+    np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
+    X2, extra = stage2_matrix(split, (pairs.s1_code, pairs.t_code), pairs.X, p1)
+    log(f'stage 2 (+ {", ".join(extra)})')
     p2, m2 = cross_fit(pairs, X2, folds, es_fold)
     del X2
 
@@ -360,7 +401,7 @@ def run_cv(split):
         json.dump(choice, f, indent=2)
     log(f'best: {choice} -> {path}')
 
-    imp = pd.Series(m2.feature_importance('gain'), index=pairs.feats + CONTEXT).sort_values(ascending=False)
+    imp = pd.Series(m2.feature_importance('gain'), index=pairs.feats + extra).sort_values(ascending=False)
     print('\n== stage-2 feature importance (gain share, top 20)\n' + (imp / imp.sum()).head(20).to_string(float_format='%.4f'))
     np.save(os.path.join(config.CACHE_DIR, split, 'oof_p2.npy'), p2)   # for error analysis
 
@@ -371,10 +412,11 @@ def run_fit(split):
     folds, es_fold = pairs.row_fold(split, 2, 'mlc26-cv'), pairs.row_fold(split, 10, 'mlc26-es')
     # stage 2 must be trained on *out-of-fold* stage-1 probabilities, as at test time
     p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
+    np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
     full = lgb.Dataset(pairs.X, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
     m1 = fit_on(full, all_rows, es_fold)
     del full
-    X2 = np.hstack([pairs.X, context_features(pairs.s1_code, pairs.t_code, p1)])
+    X2, extra = stage2_matrix(split, (pairs.s1_code, pairs.t_code), pairs.X, p1)
     full = lgb.Dataset(X2, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
     m2 = fit_on(full, all_rows, es_fold)
     os.makedirs(MODEL_DIR, exist_ok=True)
@@ -385,7 +427,7 @@ def run_fit(split):
         with open(decode_path, 'w') as f:
             json.dump({'method': 'expected_f', 'param': 0.0, 'cv_f05': None, 'split': 'default'}, f, indent=2)
     with open(os.path.join(MODEL_DIR, 'features.json'), 'w') as f:
-        json.dump({'stage1': pairs.feats, 'stage2': pairs.feats + CONTEXT, 'trained_on': split}, f, indent=2)
+        json.dump({'stage1': pairs.feats, 'stage2': pairs.feats + extra, 'trained_on': split}, f, indent=2)
     log(f'saved models to {MODEL_DIR} ({m1.best_iteration} / {m2.best_iteration} trees)')
 
 
@@ -411,6 +453,11 @@ def run_predict(split, shift=None):
     s1_code, t_code, src, p1 = (np.concatenate(a) for a in (s1c, tc, src, p1))
     log(f'stage 1: {len(p1):,} pairs in {len(parts)} parts')
     ctx = context_features(s1_code, t_code, p1)
+    if 'ce' in fl['stage2']:   # model was trained with the cross-encoder member
+        ce = ce_features(split, s1_code, t_code)
+        assert ce is not None, f'model expects cross-encoder scores: run cross_encoder.py score --split {split}'
+        ctx = np.hstack([ctx, ce])
+        del ce
     p2, off = np.empty(len(p1), np.float32), 0
     for path, n in zip(parts, sizes):
         _, X, _ = read_part(path, fl['stage1'])

@@ -32,7 +32,10 @@ CANDIDATE_PAIRS = os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv')
 VAL_FRACTION = 0.10
 SPLIT_SEED = 'mlc26'
 
-SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val')
+SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val', 'ce_train')
+# ce_train: ~5% of local_train's Source 1 against ALL local_train targets
+# (data_loader.py --ce-train). Training data for the cross-encoder that is
+# disjoint from local_val and test, so its scores there are out-of-sample.
 
 
 def split_paths(name):

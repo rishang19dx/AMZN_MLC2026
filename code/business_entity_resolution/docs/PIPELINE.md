@@ -16,9 +16,9 @@ This is the living handoff doc. For background and the history of what was built
 | Normalisation | `normalize.py`, `translit.py` | Country-agnostic; native scripts | **v2:** learned native-script dictionary (from `local_train` only) + anyascii (ISC; Unidecode dropped, GPL-2) | ✅ dictionary covers 98.4% of `local_val` native-script words |
 | Blocking | `blocking.py` | High recall, bounded candidates, exact set fed to the model | v1 passes (addr K=20 + full K=30); now writes per-(country, pass) parts and merges them on disk with DuckDB, so test fits in memory | ✅ `local_val`: **98.8%** of true pairs found, F0.5 ceiling **0.996**. ❌ test runtime not measured yet |
 | Features | `features.py` | Pair evidence | 37 features, written in parts keyed by integer row indices | ✅ `local_val`: 200 s, 5.6 GB peak |
-| Matcher | `match.py` | Precise, calibrated | two-stage LightGBM with list and competition context | ✅ cross-fit on `local_val`: **F0.5 0.9827** (baseline, before the dictionary); dictionary rerun in progress |
+| Matcher | `match.py` | Precise, calibrated | two-stage LightGBM with list and competition context | ✅ cross-fit on `local_val`: **F0.5 0.9858** (v2, with the dictionary; v1 was 0.9827) |
 | Assignment + decoding | `match.py` | Each target → ≤1 S1; F0.5-optimal set per S1 | one S1 per target, per-source caps, expected-F0.5 decoding | ✅ `tests/test_match.py`; measured in §4 |
-| Cross-encoder | `cross_encoder.py` | MIT/Apache, ≤8B params | **TODO** (Kaggle T4) | – |
+| Cross-encoder | `cross_encoder.py`, `notebooks/kaggle_cross_encoder.ipynb` | MIT/Apache, ≤8B params | mDeBERTa-v3-base trained on the `ce_train` split (disjoint from `local_val` and test), band-only scoring, auto-used by `match.py` stage 2 when `ce_scores.parquet` exists | ✅ train/score smoke-tested on CPU with a tiny model. ❌ not yet trained on the T4 |
 | Package | `scripts/run_pipeline.sh`, `utils/validate_submission.py`, `Documentation_template.md` | Zip; outputs reproducible from data using only the package | end-to-end script done | ✅ full chain + validator **PASS** on a small test sample. ❌ not yet on the full test set; docs and zip TODO |
 
 Legacy code, kept for reference only: `blocking_legacy.py`, `matching.py`, `preprocess.py` (they still import Unidecode, which is no longer in `requirements.txt`).
@@ -73,7 +73,18 @@ Baseline v1 (Unidecode features): **F0.5 = 0.9827** (India 0.9752, US 0.9877).
 - Where the loss is: precision 0.996, recall 0.960. 30.9k missed pairs vs 3.1k false matches; ~13.6k of the misses were never retrieved by blocking.
 - Calibration is excellent: predicted probability matches the observed match rate within ~0.03 in every bin, which is what expected-F decoding needs.
 
-v2 (dictionary features): _run in progress; fill in._
+**v2 (dictionary + anyascii features): F0.5 = 0.9858** (India **0.9835**, US 0.9874), **+0.0031** over v1.
+
+| | v1 (Unidecode) | v2 (dictionary) |
+|---|---|---|
+| F0.5 ALL / India / US | 0.9827 / 0.9752 / 0.9877 | **0.9858 / 0.9835 / 0.9874** |
+| precision / recall (averaged per entity) | 0.9963 / 0.9604 | 0.9965 / **0.9675** |
+| singleton accuracy | 0.9775 | **0.9809** |
+| missed pairs / false matches | 30,868 / 3,084 | **25,370 / 2,863** |
+| stage 1 only → + stage 2 context | 0.9800 → 0.9827 | 0.9836 → 0.9858 |
+| best threshold vs expected-F decoding | 0.98233 vs 0.98265 | 0.98563 vs **0.98582** |
+
+The India gain (+0.0083) is the native-script dictionary working as intended; the US change (−0.0003) is within noise (anyascii vs Unidecode on accented Latin). Decoding choice for test: expected-F0.5, no shift (`cache/models/decode.json`).
 
 ## 5. Decisions (and why)
 
