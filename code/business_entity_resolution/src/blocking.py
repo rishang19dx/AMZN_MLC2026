@@ -1,360 +1,251 @@
 """
-Improved Blocking Module for Business Entity Resolution.
+Blocking / candidate generation, v1: lexical TF-IDF nearest neighbours.
 
-Strategy (multi-pass, union of blocks):
-1. Country blocking (mandatory filter — never compare across countries)
-2. Exact name_base match (high precision, catches trivial matches)
-3. N-gram (character trigram) blocking on name_base via TF-IDF + cosine similarity
-4. Token overlap blocking on address tokens (sorted first-N tokens)
+For every S1 entity, retrieve the top-K most similar S2+S3 records *within the
+same country* (true matches never cross countries; country is compared as an
+open string label, so France needs no special handling). Several passes look
+at different fields, and the union of their top-K lists is the candidate set:
 
-Each pass generates candidate pairs. We take the UNION of all passes
-so recall is maximised, then the downstream matcher filters for precision.
+  name  char 3-grams of the normalised name       typos, spacing, transliteration noise
+  addr  word tokens of the normalised address     trade names / name changes (house no. + street)
+  full  word tokens of name + address             joint evidence when each field alone is weak
+
+IDF is fitted per country on S1 + targets (unsupervised, uses only the provided
+files), which down-weights "pvt", "limited", "llc", "sarl", "road" etc. without
+any hand-made lists. Features whose document frequency among the targets is
+above --max-df are dropped: they carry little signal and dominate the cost of
+the sparse matrix product.
+
+Outputs (per split):
+  <BER_OUTPUT_DIR>/<split>/candidate_pairs.tsv   submission-format candidate lists
+  <BER_CACHE_DIR>/<split>/candidates.parquet     one row per pair with per-pass
+      scores and ranks (the contract the matcher reads; see docs/PIPELINE.md)
+
+Usage:
+  python src/blocking.py --split local_val            # dev loop, scores itself vs ground truth
+  python src/blocking.py --split test
 """
 
+import argparse
 import os
 import sys
-import csv
 import time
-import re
-from collections import defaultdict
-from itertools import islice
 
-# Add src dir to path for imports
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from preprocess import clean_text, extract_legal_terms, normalize_address
+from data_loader import read_tsv
+from normalize import is_non_latin, norm
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def char_ngrams(text, n=3):
-    """Generate character n-grams from text."""
-    if len(text) < n:
-        return [text] if text else []
-    return [text[i:i+n] for i in range(len(text) - n + 1)]
+PASSES = {
+    # pass name: (field, vectorizer kwargs)
+    'name': ('name_n', dict(analyzer='char_wb', ngram_range=(3, 3))),
+    'addr': ('addr_n', dict(analyzer='word', token_pattern=r'\S+')),
+    'full': ('full_n', dict(analyzer='word', token_pattern=r'\S+')),
+}
 
 
-def word_tokens(text):
-    """Split text into word tokens."""
-    return text.split() if text else []
-
-
-def jaccard(set_a, set_b):
-    """Jaccard similarity between two sets."""
-    if not set_a or not set_b:
-        return 0.0
-    intersection = len(set_a & set_b)
-    union = len(set_a | set_b)
-    return intersection / union if union > 0 else 0.0
-
-
-def sorted_token_key(text, n_tokens=3):
-    """Create a blocking key from the first N sorted tokens."""
-    tokens = sorted(text.split())
-    return " ".join(tokens[:n_tokens])
+def log(msg, t0=[time.time()]):
+    print(f'[{time.time() - t0[0]:7.1f}s] {msg}', flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Data loading (streaming, memory-efficient)
+# Data
 # ---------------------------------------------------------------------------
 
-def load_source_records(filepath, max_rows=None):
-    """
-    Load source records from TSV, applying preprocessing on the fly.
-    Returns a list of dicts with original + cleaned fields.
-    """
-    records = []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for i, row in enumerate(reader):
-            if max_rows and i >= max_rows:
-                break
+def load_records(path):
+    df = read_tsv(path)
+    df['name_n'] = df['business_name'].map(norm)
+    df['addr_n'] = df['business_address'].map(norm)
+    df['full_n'] = df['name_n'] + ' ' + df['addr_n']
+    return df
 
-            country_clean = clean_text(row.get('country', ''))
-            name_clean = clean_text(row.get('business_name', ''))
-            addr_clean = clean_text(row.get('business_address', ''))
-            name_base, name_legal = extract_legal_terms(name_clean)
-            addr_norm = normalize_address(addr_clean, country_clean)
 
-            records.append({
-                'entity_id': row['entity_id'],
-                'country': country_clean,
-                'name_base': name_base,
-                'name_clean': name_clean,
-                'name_legal': name_legal,
-                'addr_norm': addr_norm,
-            })
-    return records
+def load_split(split):
+    p = config.split_paths(split)
+    s1 = load_records(p['s1'])
+    log(f'S1: {len(s1):,} records')
+    tg = pd.concat([load_records(p['s2']), load_records(p['s3'])], ignore_index=True)
+    log(f'S2+S3: {len(tg):,} records')
+    return s1, tg
 
 
 # ---------------------------------------------------------------------------
-# Blocking passes
+# Sparse top-K retrieval
 # ---------------------------------------------------------------------------
 
-def build_inverted_index(records, key_fn):
+def _topk_rows(X, YT, k, start, chunk):
+    """Top-k columns of X[start:start+chunk] @ YT, as flat (row, col, score) arrays."""
+    P = (X[start:start + chunk] @ YT).tocsr()
+    indptr, indices, data = P.indptr, P.indices, P.data
+    rows, cols, vals = [], [], []
+    for i in range(P.shape[0]):
+        a, b = indptr[i], indptr[i + 1]
+        if a == b:
+            continue
+        d = data[a:b]
+        if b - a > k:
+            sel = np.argpartition(-d, k)[:k]
+            c, d = indices[a:b][sel], d[sel]
+        else:
+            c = indices[a:b]
+        rows.append(np.full(len(c), start + i, dtype=np.int32))
+        cols.append(c.astype(np.int32))
+        vals.append(d.astype(np.float32))
+    if not rows:
+        return np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32)
+    return np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+
+
+_SHARED = {}  # matrices handed to forked workers without pickling
+
+
+def _worker(args):
+    start, chunk, k = args
+    return _topk_rows(_SHARED['X'], _SHARED['YT'], k, start, chunk)
+
+
+def topk_sparse(X, Y, k, chunk=2048, workers=1):
     """
-    Build an inverted index: key -> list of record indices.
-    key_fn(record) should return a list of keys for that record.
+    For each row of X return the k columns of X @ Y.T with the highest score
+    (rows are L2-normalised TF-IDF, so scores are cosines). Returns three flat
+    arrays (row, col, score); rows with fewer than k non-zero scores return fewer.
+    Row chunks run in parallel in forked worker processes (Linux).
     """
-    index = defaultdict(list)
-    for idx, rec in enumerate(records):
-        for key in key_fn(rec):
-            if key:  # skip empty keys
-                index[key].append(idx)
-    return index
-
-
-def block_exact_name(s1_records, target_records):
-    """
-    Pass 1: Exact match on (country, name_base).
-    Very fast, very precise.
-    """
-    print("  [Block 1] Exact name_base + country ...")
-    target_index = defaultdict(list)
-    for idx, rec in enumerate(target_records):
-        key = (rec['country'], rec['name_base'])
-        if rec['name_base']:  # skip empty
-            target_index[key].append(idx)
-
-    candidates = defaultdict(set)
-    for s1_rec in s1_records:
-        key = (s1_rec['country'], s1_rec['name_base'])
-        for tidx in target_index.get(key, []):
-            candidates[s1_rec['entity_id']].add(target_records[tidx]['entity_id'])
-
-    total = sum(len(v) for v in candidates.values())
-    print(f"    -> {len(candidates)} S1 entities got {total} candidates")
-    return candidates
-
-
-def block_name_prefix(s1_records, target_records, prefix_len=4):
-    """
-    Pass 2: Match on (country, first N chars of name_base).
-    Catches minor typos after the prefix.
-    """
-    print(f"  [Block 2] Name prefix({prefix_len}) + country ...")
-    target_index = defaultdict(list)
-    for idx, rec in enumerate(target_records):
-        prefix = rec['name_base'][:prefix_len] if rec['name_base'] else ''
-        if prefix:
-            key = (rec['country'], prefix)
-            target_index[key].append(idx)
-
-    candidates = defaultdict(set)
-    for s1_rec in s1_records:
-        prefix = s1_rec['name_base'][:prefix_len] if s1_rec['name_base'] else ''
-        if prefix:
-            key = (s1_rec['country'], prefix)
-            for tidx in target_index.get(key, []):
-                candidates[s1_rec['entity_id']].add(target_records[tidx]['entity_id'])
-
-    total = sum(len(v) for v in candidates.values())
-    print(f"    -> {len(candidates)} S1 entities got {total} candidates")
-    return candidates
-
-
-def block_name_tokens(s1_records, target_records, n_tokens=2):
-    """
-    Pass 3: Sorted word-token blocking on name_base (within same country).
-    Takes the first N sorted non-trivial word tokens as a blocking key.
-    This is O(n+m) via inverted index and much faster than trigram scanning.
-    """
-    print(f"  [Block 3] Name sorted-word-token key (n={n_tokens}) + country ...")
-
-    def make_key(name_base, n):
-        tokens = sorted(set(name_base.split()))
-        # Skip very short tokens (1 char) that aren't discriminative
-        tokens = [t for t in tokens if len(t) > 1]
-        return " ".join(tokens[:n])
-
-    target_index = defaultdict(list)
-    for idx, rec in enumerate(target_records):
-        key_str = make_key(rec['name_base'], n_tokens)
-        if key_str.strip():
-            key = (rec['country'], key_str)
-            target_index[key].append(idx)
-
-    candidates = defaultdict(set)
-    for s1_rec in s1_records:
-        key_str = make_key(s1_rec['name_base'], n_tokens)
-        if key_str.strip():
-            key = (s1_rec['country'], key_str)
-            for tidx in target_index.get(key, []):
-                candidates[s1_rec['entity_id']].add(target_records[tidx]['entity_id'])
-
-    total = sum(len(v) for v in candidates.values())
-    print(f"    -> {len(candidates)} S1 entities got {total} candidates")
-    return candidates
-
-
-def block_address_tokens(s1_records, target_records, n_tokens=3):
-    """
-    Pass 4: Sorted-token blocking on address.
-    Takes the first N sorted tokens of the normalized address + country as a blocking key.
-    """
-    print(f"  [Block 4] Address sorted-token key (n={n_tokens}) + country ...")
-    target_index = defaultdict(list)
-    for idx, rec in enumerate(target_records):
-        key_str = sorted_token_key(rec['addr_norm'], n_tokens)
-        if key_str.strip():
-            key = (rec['country'], key_str)
-            target_index[key].append(idx)
-
-    candidates = defaultdict(set)
-    for s1_rec in s1_records:
-        key_str = sorted_token_key(s1_rec['addr_norm'], n_tokens)
-        if key_str.strip():
-            key = (s1_rec['country'], key_str)
-            for tidx in target_index.get(key, []):
-                candidates[s1_rec['entity_id']].add(target_records[tidx]['entity_id'])
-
-    total = sum(len(v) for v in candidates.values())
-    print(f"    -> {len(candidates)} S1 entities got {total} candidates")
-    return candidates
-
-
-# ---------------------------------------------------------------------------
-# Main blocking pipeline
-# ---------------------------------------------------------------------------
-
-def merge_candidates(*candidate_dicts):
-    """Union all candidate dicts into one."""
-    merged = defaultdict(set)
-    for d in candidate_dicts:
-        for s1_id, cand_set in d.items():
-            merged[s1_id].update(cand_set)
-    return merged
-
-
-def run_blocking(s1_path, s2_path, s3_path, output_path, s1_max_rows=None):
-    """
-    Runs the full multi-pass blocking pipeline.
-    s1_max_rows: only sample S1 (for quick testing). S2 and S3 are always loaded fully
-                 because true matches can be anywhere.
-    """
-    print("=" * 60)
-    print("BLOCKING PIPELINE")
-    print("=" * 60)
-
-    t0 = time.time()
-
-    print("\nLoading & preprocessing Source 1 ...")
-    s1_records = load_source_records(s1_path, max_rows=s1_max_rows)
-    print(f"  Loaded {len(s1_records)} S1 records")
-
-    print("Loading & preprocessing Source 2 (full) ...")
-    s2_records = load_source_records(s2_path)
-    print(f"  Loaded {len(s2_records)} S2 records")
-
-    print("Loading & preprocessing Source 3 (full) ...")
-    s3_records = load_source_records(s3_path)
-    print(f"  Loaded {len(s3_records)} S3 records")
-
-    target_records = s2_records + s3_records
-    print(f"\nTotal target records: {len(target_records)}")
-
-    print("\nRunning blocking passes ...")
-    c1 = block_exact_name(s1_records, target_records)
-    c2 = block_name_prefix(s1_records, target_records, prefix_len=4)
-    c3 = block_name_tokens(s1_records, target_records)
-    c4 = block_address_tokens(s1_records, target_records, n_tokens=3)
-
-    print("\nMerging all candidate sets (union) ...")
-    all_candidates = merge_candidates(c1, c2, c3, c4)
-
-    # Ensure every S1 entity has a row (even if empty)
-    s1_ids = {rec['entity_id'] for rec in s1_records}
-    for s1_id in s1_ids:
-        if s1_id not in all_candidates:
-            all_candidates[s1_id] = set()
-
-    total_pairs = sum(len(v) for v in all_candidates.values())
-    entities_with_cands = sum(1 for v in all_candidates.values() if v)
-    print(f"\nFinal: {len(all_candidates)} S1 entities, "
-          f"{entities_with_cands} with candidates, {total_pairs} total pairs")
-    if s1_ids:
-        print(f"Avg candidates per S1 entity: {total_pairs / len(s1_ids):.1f}")
-
-    # Write output
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(['source1_entity_id', 'candidate_entity_ids'])
-        for s1_id in sorted(all_candidates.keys()):
-            cand_str = ",".join(sorted(all_candidates[s1_id]))
-            writer.writerow([s1_id, cand_str])
-
-    elapsed = time.time() - t0
-    print(f"\nBlocking completed in {elapsed:.1f}s. Output: {output_path}")
-    return all_candidates, s1_ids
-
-
-# ---------------------------------------------------------------------------
-# Recall evaluation against ground truth
-# ---------------------------------------------------------------------------
-
-def evaluate_blocking_recall(candidates, gt_path, s1_ids=None):
-    """
-    Measures blocking recall: what fraction of true matches appear
-    in the candidate set.
-    s1_ids: if provided, only evaluate S1 entities in this set.
-    """
-    print("\n" + "=" * 60)
-    print("BLOCKING RECALL EVALUATION")
-    print("=" * 60)
-
-    total_true = 0
-    total_found = 0
-    total_entities = 0
-    perfect_recall = 0
-
-    with open(gt_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            s1_id = row['source1_entity_id']
-            
-            # Skip S1 entities not in our sample
-            if s1_ids and s1_id not in s1_ids:
-                continue
-                
-            matched_str = row.get('matched_entity_ids', '')
-            if not matched_str or not matched_str.strip():
-                continue  # singleton, skip for recall calc
-
-            true_matches = set(matched_str.split(','))
-            cand_set = candidates.get(s1_id, set())
-
-            found = len(true_matches & cand_set)
-            total_true += len(true_matches)
-            total_found += found
-            total_entities += 1
-            if found == len(true_matches):
-                perfect_recall += 1
-
-    if total_true > 0:
-        recall = total_found / total_true
-        print(f"  True match pairs evaluated: {total_true}")
-        print(f"  Found in candidates:        {total_found}")
-        print(f"  Blocking Recall:            {recall:.4f} ({recall*100:.2f}%)")
-        print(f"  Entities with perfect recall: {perfect_recall}/{total_entities} "
-              f"({perfect_recall/total_entities*100:.1f}%)")
+    YT = Y.T.tocsr()
+    jobs = [(s, chunk, k) for s in range(0, X.shape[0], chunk)]
+    if workers > 1 and len(jobs) > 1:
+        import multiprocessing as mp
+        _SHARED.update(X=X, YT=YT)
+        with mp.get_context('fork').Pool(workers) as pool:
+            out = pool.map(_worker, jobs)
+        _SHARED.clear()
     else:
-        print("  No true matches found in ground truth to evaluate.")
+        out = [_topk_rows(X, YT, k, s, c) for s, c, k in jobs]
+    return tuple(np.concatenate([o[j] for o in out]) for j in range(3))
 
-    return total_found / total_true if total_true > 0 else 0.0
+
+def run_pass(s1_text, tg_text, k, max_df, vec_kwargs, workers=1):
+    vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32, min_df=2, **vec_kwargs)
+    vec.fit(pd.concat([s1_text, tg_text]))
+    X, Y = vec.transform(s1_text), vec.transform(tg_text)
+    # drop features that are too common among targets (after normalisation, so
+    # scores are partial cosines; ranking by rare evidence is what we want)
+    df = np.bincount(Y.indices, minlength=Y.shape[1])
+    keep = df <= max_df * Y.shape[0]
+    X, Y = X[:, keep], Y[:, keep]
+    return topk_sparse(X.tocsr(), Y.tocsr(), k, workers=workers)
 
 
-if __name__ == "__main__":
-    # Quick test: sample 1000 S1 entities, but load ALL of S2/S3
-    s1_sample = 1000  # Set to None for full run
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
-    candidates, s1_ids = run_blocking(
-        s1_path=config.TRAIN_S1,
-        s2_path=config.TRAIN_S2,
-        s3_path=config.TRAIN_S3,
-        output_path=config.CANDIDATE_PAIRS,
-        s1_max_rows=s1_sample
-    )
+def generate_candidates(s1, tg, ks, max_df, workers=1):
+    """Returns a DataFrame with one row per (s1, target) pair and, for each
+    pass, the cosine score and within-S1 rank (NaN if the pass missed it)."""
+    parts = []
+    for country, s1_c in s1.groupby('country', sort=False):
+        tg_c = tg[tg['country'] == country]
+        if tg_c.empty:
+            continue
+        s1_idx, tg_idx = s1_c.index.to_numpy(), tg_c.index.to_numpy()
+        for pname, (field, kw) in PASSES.items():
+            k = ks[pname]
+            if k <= 0:
+                continue
+            r, c, v = run_pass(s1_c[field], tg_c[field], k, max_df, kw, workers)
+            part = pd.DataFrame({'s1': s1_idx[r].astype(np.int64), 'tg': tg_idx[c].astype(np.int64)})
+            part[f'score_{pname}'] = v
+            part[f'rank_{pname}'] = part.groupby('s1')[f'score_{pname}'].rank(
+                ascending=False, method='first').astype(np.float32)
+            parts.append(part)
+            log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
+    # one row per pair; a pass that did not retrieve the pair leaves NaN
+    wide = pd.concat(parts, ignore_index=True).groupby(['s1', 'tg'], sort=False).max().reset_index()
+    for pname in PASSES:  # a disabled pass still gets (all-NaN) columns
+        for col in (f'score_{pname}', f'rank_{pname}'):
+            if col not in wide:
+                wide[col] = np.float32('nan')
+    return wide
 
-    evaluate_blocking_recall(candidates, config.TRAIN_GT, s1_ids=s1_ids)
+
+def write_outputs(split, s1, tg, cand):
+    out_dir = os.path.join(config.OUTPUT_DIR, split)
+    cache_dir = os.path.join(config.CACHE_DIR, split)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    cand = cand.assign(s1_id=s1['entity_id'].to_numpy()[cand['s1']],
+                       cand_id=tg['entity_id'].to_numpy()[cand['tg']])
+    cols = ['s1_id', 'cand_id'] + [c for c in cand.columns if c.startswith(('score_', 'rank_'))]
+    import duckdb
+    pq = os.path.join(cache_dir, 'candidates.parquet')
+    duckdb.from_df(cand[cols]).write_parquet(pq, compression='zstd')
+
+    lists = cand.groupby('s1_id')['cand_id'].agg(lambda x: ','.join(sorted(x)))
+    lists = lists.reindex(s1['entity_id'], fill_value='')  # every S1 gets a row
+    tsv = os.path.join(out_dir, 'candidate_pairs.tsv')
+    with open(tsv, 'w', encoding='utf-8') as f:
+        f.write('source1_entity_id\tcandidate_entity_ids\n')
+        for s1_id, ids in lists.items():
+            f.write(f'{s1_id}\t{ids}\n')
+    log(f'wrote {tsv} and {pq}')
+    return tsv
+
+
+def report_by_pass(split, s1, tg, cand):
+    """Dev-loop diagnostics: recall of each pass alone, and of the union,
+    overall and on the hard buckets (non-Latin target names)."""
+    from evaluate import read_ground_truth
+    gt = read_ground_truth(config.split_paths(split)['gt'])
+    s1_ids, tg_ids = s1['entity_id'].to_numpy(), tg['entity_id'].to_numpy()
+    true = pd.DataFrame([(a, b) for a, bs in gt.items() for b in bs], columns=['s1_id', 'cand_id'])
+    cand = cand.assign(s1_id=s1_ids[cand['s1']], cand_id=tg_ids[cand['tg']])
+    m = true.merge(cand, on=['s1_id', 'cand_id'], how='left')
+    tgc = tg.set_index('entity_id')
+    m['country'] = tgc.loc[m['cand_id'], 'country'].to_numpy()
+    m['non_latin'] = tgc.loc[m['cand_id'], 'business_name'].map(is_non_latin).to_numpy()
+    passes = [p for p in PASSES if f'score_{p}' in m]
+    found = {p: m[f'score_{p}'].notna() for p in passes}
+    m['union'] = np.logical_or.reduce(list(found.values()))
+    print('\n== pair recall by pass (true pairs found / true pairs)')
+    buckets = {'ALL': m.index == m.index}
+    buckets.update({c: m['country'] == c for c in m['country'].unique()})
+    buckets['non-Latin name'] = m['non_latin']
+    print(f"{'':16}{'n_true':>10}" + ''.join(f'{p:>9}' for p in passes) + f"{'union':>9}")
+    for b, mask in buckets.items():
+        row = f'{b:16}{mask.sum():>10,}'
+        row += ''.join(f'{found[p][mask].mean():9.4f}' for p in passes)
+        print(row + f"{m['union'][mask].mean():9.4f}")
+    print(f'\ncandidates: {len(cand):,} pairs, {len(cand) / len(s1):.1f} per S1')
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--split', default='local_val', choices=config.SPLIT_NAMES)
+    ap.add_argument('--k-name', type=int, default=0, help='0 disables the pass (slow, weak on local_val)')
+    ap.add_argument('--k-addr', type=int, default=20)
+    ap.add_argument('--k-full', type=int, default=30)
+    ap.add_argument('--max-df', type=float, default=0.02,
+                    help='drop features present in more than this fraction of targets. Lower is much faster '
+                         'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
+    ap.add_argument('--workers', type=int, default=os.cpu_count())
+    ap.add_argument('--no-write', action='store_true', help='diagnostics only')
+    args = ap.parse_args()
+
+    s1, tg = load_split(args.split)
+    ks = {'name': args.k_name, 'addr': args.k_addr, 'full': args.k_full}
+    cand = generate_candidates(s1, tg, ks, args.max_df, args.workers)
+    log(f'{len(cand):,} candidate pairs')
+    if args.split != 'test':
+        report_by_pass(args.split, s1, tg, cand)
+    if not args.no_write:
+        write_outputs(args.split, s1, tg, cand)
+
+
+if __name__ == '__main__':
+    main()
