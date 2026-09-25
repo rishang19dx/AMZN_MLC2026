@@ -12,3 +12,6 @@ venv.bak/
 output/
 .ipynb_checkpoints/
 dataset/
+cache/
+*.tar.zst
+*.tar.zst.sha256

@@ -6,6 +6,8 @@ scikit-learn==1.7.2
 duckdb==1.5.5
 Unidecode==1.4.0
 tqdm==4.70.1
+RapidFuzz==3.14.5
+lightgbm==4.7.0
 
 # Matching models. The local env uses the CPU build of torch (2.14.0+cpu);
 # for a GPU install the CUDA wheel of the same version from download.pytorch.org.
