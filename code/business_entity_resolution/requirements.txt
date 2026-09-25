@@ -4,7 +4,7 @@ pandas==2.3.3
 scipy==1.15.3
 scikit-learn==1.7.2
 duckdb==1.5.5
-Unidecode==1.4.0
+anyascii==0.3.3          # ISC; replaces Unidecode (GPL-2), which only legacy files still import
 tqdm==4.70.1
 RapidFuzz==3.14.5
 lightgbm==4.7.0

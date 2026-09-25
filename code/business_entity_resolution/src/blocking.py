@@ -6,15 +6,19 @@ same country* (true matches never cross countries; country is compared as an
 open string label, so France needs no special handling). Several passes look
 at different fields, and the union of their top-K lists is the candidate set:
 
-  name  char 3-grams of the normalised name       typos, spacing, transliteration noise
+  name  char 3-grams of the normalised name       off by default (slow, weak; REPORT §3)
   addr  word tokens of the normalised address     trade names / name changes (house no. + street)
-  full  word tokens of name + address             joint evidence when each field alone is weak
+  full  word tokens of name + address             joint evidence; the main pass
 
 IDF is fitted per country on S1 + targets (unsupervised, uses only the provided
 files), which down-weights "pvt", "limited", "llc", "sarl", "road" etc. without
 any hand-made lists. Features whose document frequency among the targets is
 above --max-df are dropped: they carry little signal and dominate the cost of
 the sparse matrix product.
+
+Scales to test (~86M raw pairs): each (country, pass) result is written to a
+parquet part as soon as it is computed, and DuckDB merges the parts on disk,
+so the full pair table is never held in pandas.
 
 Outputs (per split):
   <BER_OUTPUT_DIR>/<split>/candidate_pairs.tsv   submission-format candidate lists
@@ -28,6 +32,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
 import time
 
@@ -41,10 +46,10 @@ from data_loader import read_tsv
 from normalize import is_non_latin, norm
 
 PASSES = {
-    # pass name: (field, vectorizer kwargs)
-    'name': ('name_n', dict(analyzer='char_wb', ngram_range=(3, 3))),
-    'addr': ('addr_n', dict(analyzer='word', token_pattern=r'\S+')),
-    'full': ('full_n', dict(analyzer='word', token_pattern=r'\S+')),
+    # pass name: (fields joined with a space, vectorizer kwargs)
+    'name': (('name_n',), dict(analyzer='char_wb', ngram_range=(3, 3))),
+    'addr': (('addr_n',), dict(analyzer='word', token_pattern=r'\S+')),
+    'full': (('name_n', 'addr_n'), dict(analyzer='word', token_pattern=r'\S+')),
 }
 
 
@@ -58,10 +63,13 @@ def log(msg, t0=[time.time()]):
 
 def load_records(path):
     df = read_tsv(path)
-    df['name_n'] = df['business_name'].map(norm)
-    df['addr_n'] = df['business_address'].map(norm)
-    df['full_n'] = df['name_n'] + ' ' + df['addr_n']
-    return df
+    return pd.DataFrame({
+        'entity_id': df['entity_id'],
+        'country': df['country'],
+        'name_n': df['business_name'].map(norm),
+        'addr_n': df['business_address'].map(norm),
+        'nonlatin': df['business_name'].map(is_non_latin),
+    })
 
 
 def load_split(split):
@@ -71,6 +79,10 @@ def load_split(split):
     tg = pd.concat([load_records(p['s2']), load_records(p['s3'])], ignore_index=True)
     log(f'S2+S3: {len(tg):,} records')
     return s1, tg
+
+
+def field_text(df, fields):
+    return df[fields[0]] if len(fields) == 1 else df[fields[0]] + ' ' + df[fields[1]]
 
 
 # ---------------------------------------------------------------------------
@@ -140,88 +152,112 @@ def run_pass(s1_text, tg_text, k, max_df, vec_kwargs, workers=1):
     return topk_sparse(X.tocsr(), Y.tocsr(), k, workers=workers)
 
 
+def rank_within(rows, scores):
+    """1-based rank of each score within its row group (descending)."""
+    order = np.lexsort((-scores, rows))
+    rs = rows[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(rs)) + 1]
+    sizes = np.diff(np.r_[starts, len(rs)])
+    rank = np.empty(len(rows), np.float32)
+    rank[order] = np.arange(len(rs)) - np.repeat(starts, sizes) + 1
+    return rank
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def generate_candidates(s1, tg, ks, max_df, workers=1):
-    """Returns a DataFrame with one row per (s1, target) pair and, for each
-    pass, the cosine score and within-S1 rank (NaN if the pass missed it)."""
-    parts = []
-    for country, s1_c in s1.groupby('country', sort=False):
+def duck(split):
+    """DuckDB connection with a memory cap and spill directory under the cache."""
+    import duckdb
+    con = duckdb.connect()
+    tmp = os.path.join(config.CACHE_DIR, split, 'duckdb_tmp')
+    os.makedirs(tmp, exist_ok=True)
+    con.execute(f"SET memory_limit='{os.environ.get('BER_DUCKDB_MEM', '6GB')}'")
+    con.execute(f"SET temp_directory='{tmp}'")
+    return con
+
+
+def generate_candidates(split, s1, tg, ks, max_df, workers=1):
+    """Writes one parquet part per (country, pass): columns s1, tg (row indices),
+    score_<pass>, rank_<pass>. Returns the part directory."""
+    import duckdb
+    part_dir = os.path.join(config.CACHE_DIR, split, 'blocking_parts')
+    shutil.rmtree(part_dir, ignore_errors=True)
+    os.makedirs(part_dir)
+    for ci, (country, s1_c) in enumerate(s1.groupby('country', sort=False)):
         tg_c = tg[tg['country'] == country]
         if tg_c.empty:
             continue
-        s1_idx, tg_idx = s1_c.index.to_numpy(), tg_c.index.to_numpy()
-        for pname, (field, kw) in PASSES.items():
-            k = ks[pname]
-            if k <= 0:
+        s1_idx, tg_idx = s1_c.index.to_numpy(np.int32), tg_c.index.to_numpy(np.int32)
+        for pname, (fields, kw) in PASSES.items():
+            if ks[pname] <= 0:
                 continue
-            r, c, v = run_pass(s1_c[field], tg_c[field], k, max_df, kw, workers)
-            part = pd.DataFrame({'s1': s1_idx[r].astype(np.int64), 'tg': tg_idx[c].astype(np.int64)})
-            part[f'score_{pname}'] = v
-            part[f'rank_{pname}'] = part.groupby('s1')[f'score_{pname}'].rank(
-                ascending=False, method='first').astype(np.float32)
-            parts.append(part)
+            r, c, v = run_pass(field_text(s1_c, fields), field_text(tg_c, fields), ks[pname], max_df, kw, workers)
+            part = pd.DataFrame({'s1': s1_idx[r], 'tg': tg_idx[c],
+                                 f'score_{pname}': v, f'rank_{pname}': rank_within(r, v)})
+            duckdb.from_df(part).write_parquet(os.path.join(part_dir, f'c{ci:02d}_{pname}.parquet'))
             log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
-    # one row per pair; a pass that did not retrieve the pair leaves NaN
-    wide = pd.concat(parts, ignore_index=True).groupby(['s1', 'tg'], sort=False).max().reset_index()
-    for pname in PASSES:  # a disabled pass still gets (all-NaN) columns
-        for col in (f'score_{pname}', f'rank_{pname}'):
-            if col not in wide:
-                wide[col] = np.float32('nan')
-    return wide
+            del part, r, c, v
+    return part_dir
 
 
-def write_outputs(split, s1, tg, cand):
-    out_dir = os.path.join(config.OUTPUT_DIR, split)
+def write_outputs(split, s1, tg, part_dir, ks):
+    """Merge the parts on disk (DuckDB) into candidates.parquet + candidate_pairs.tsv."""
+    con = duck(split)
+    con.register('s1x', pd.DataFrame({'s1': np.arange(len(s1), dtype=np.int32), 's1_id': s1['entity_id']}))
+    con.register('tgx', pd.DataFrame({'tg': np.arange(len(tg), dtype=np.int32), 'cand_id': tg['entity_id']}))
+    cols = []
+    for p in PASSES:
+        if ks[p] > 0:
+            cols += [f'max(score_{p}) AS score_{p}', f'min(rank_{p}) AS rank_{p}']
+        else:
+            cols += [f'CAST(NULL AS FLOAT) AS score_{p}', f'CAST(NULL AS FLOAT) AS rank_{p}']
+    con.execute(f"""CREATE TABLE pairs AS
+        SELECT s1, tg, {', '.join(cols)}
+        FROM read_parquet('{part_dir}/*.parquet', union_by_name=true) GROUP BY s1, tg""")
+    n = con.execute('SELECT count(*) FROM pairs').fetchone()[0]
+    log(f'{n:,} candidate pairs after merging passes ({n / len(s1):.1f} per S1)')
+
     cache_dir = os.path.join(config.CACHE_DIR, split)
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    cand = cand.assign(s1_id=s1['entity_id'].to_numpy()[cand['s1']],
-                       cand_id=tg['entity_id'].to_numpy()[cand['tg']])
-    cols = ['s1_id', 'cand_id'] + [c for c in cand.columns if c.startswith(('score_', 'rank_'))]
-    import duckdb
     pq = os.path.join(cache_dir, 'candidates.parquet')
-    duckdb.from_df(cand[cols]).write_parquet(pq, compression='zstd')
+    score_cols = ', '.join(f'p.score_{q}, p.rank_{q}' for q in PASSES)
+    con.execute(f"""COPY (SELECT s1x.s1_id, tgx.cand_id, {score_cols}
+        FROM pairs p JOIN s1x USING (s1) JOIN tgx USING (tg) ORDER BY p.s1, p.tg)
+        TO '{pq}' (FORMAT parquet, COMPRESSION zstd)""")
 
-    lists = cand.groupby('s1_id')['cand_id'].agg(lambda x: ','.join(sorted(x)))
-    lists = lists.reindex(s1['entity_id'], fill_value='')  # every S1 gets a row
+    out_dir = os.path.join(config.OUTPUT_DIR, split)
+    os.makedirs(out_dir, exist_ok=True)
     tsv = os.path.join(out_dir, 'candidate_pairs.tsv')
+    cur = con.execute("""SELECT s1x.s1_id, string_agg(tgx.cand_id, ',' ORDER BY tgx.cand_id)
+        FROM s1x LEFT JOIN pairs p USING (s1) LEFT JOIN tgx ON p.tg = tgx.tg
+        GROUP BY s1x.s1, s1x.s1_id ORDER BY s1x.s1""")        # every S1 gets a row, in file order
     with open(tsv, 'w', encoding='utf-8') as f:
         f.write('source1_entity_id\tcandidate_entity_ids\n')
-        for s1_id, ids in lists.items():
-            f.write(f'{s1_id}\t{ids}\n')
+        while rows := cur.fetchmany(50_000):
+            f.writelines(f'{a}\t{b or ""}\n' for a, b in rows)
+    shutil.rmtree(part_dir, ignore_errors=True)
+    shutil.rmtree(os.path.join(cache_dir, 'duckdb_tmp'), ignore_errors=True)
     log(f'wrote {tsv} and {pq}')
-    return tsv
 
 
-def report_by_pass(split, s1, tg, cand):
+def report_by_pass(split, tg):
     """Dev-loop diagnostics: recall of each pass alone, and of the union,
-    overall and on the hard buckets (non-Latin target names)."""
+    overall, per country and on non-Latin target names."""
     from evaluate import read_ground_truth
     gt = read_ground_truth(config.split_paths(split)['gt'])
-    s1_ids, tg_ids = s1['entity_id'].to_numpy(), tg['entity_id'].to_numpy()
-    true = pd.DataFrame([(a, b) for a, bs in gt.items() for b in bs], columns=['s1_id', 'cand_id'])
-    cand = cand.assign(s1_id=s1_ids[cand['s1']], cand_id=tg_ids[cand['tg']])
-    m = true.merge(cand, on=['s1_id', 'cand_id'], how='left')
-    tgc = tg.set_index('entity_id')
-    m['country'] = tgc.loc[m['cand_id'], 'country'].to_numpy()
-    m['non_latin'] = tgc.loc[m['cand_id'], 'business_name'].map(is_non_latin).to_numpy()
-    passes = [p for p in PASSES if f'score_{p}' in m]
-    found = {p: m[f'score_{p}'].notna() for p in passes}
-    m['union'] = np.logical_or.reduce(list(found.values()))
-    print('\n== pair recall by pass (true pairs found / true pairs)')
-    buckets = {'ALL': m.index == m.index}
-    buckets.update({c: m['country'] == c for c in m['country'].unique()})
-    buckets['non-Latin name'] = m['non_latin']
-    print(f"{'':16}{'n_true':>10}" + ''.join(f'{p:>9}' for p in passes) + f"{'union':>9}")
-    for b, mask in buckets.items():
-        row = f'{b:16}{mask.sum():>10,}'
-        row += ''.join(f'{found[p][mask].mean():9.4f}' for p in passes)
-        print(row + f"{m['union'][mask].mean():9.4f}")
-    print(f'\ncandidates: {len(cand):,} pairs, {len(cand) / len(s1):.1f} per S1')
+    con = duck(split)
+    con.register('truth', pd.DataFrame([(a, b) for a, bs in gt.items() for b in bs], columns=['s1_id', 'cand_id']))
+    con.register('tgi', tg[['entity_id', 'country', 'nonlatin']])
+    pq = os.path.join(config.CACHE_DIR, split, 'candidates.parquet')
+    found = ', '.join(f'avg((c.score_{p} IS NOT NULL)::INT) AS {p}' for p in PASSES)
+    q = f"""SELECT {{bucket}} AS bucket, count(*) AS n_true, {found}, avg((c.s1_id IS NOT NULL)::INT) AS "union"
+        FROM truth t JOIN tgi ON tgi.entity_id = t.cand_id
+        LEFT JOIN read_parquet('{pq}') c ON c.s1_id = t.s1_id AND c.cand_id = t.cand_id {{where}} GROUP BY 1"""
+    rep = pd.concat([con.execute(q.format(bucket="'ALL'", where='')).df(),
+                     con.execute(q.format(bucket='tgi.country', where='')).df(),
+                     con.execute(q.format(bucket="'non-Latin name'", where='WHERE tgi.nonlatin')).df()])
+    print('\n== pair recall by pass (true pairs found / true pairs)\n' + rep.to_string(index=False, float_format='%.4f'))
 
 
 def main():
@@ -234,17 +270,14 @@ def main():
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
     ap.add_argument('--workers', type=int, default=os.cpu_count())
-    ap.add_argument('--no-write', action='store_true', help='diagnostics only')
     args = ap.parse_args()
 
     s1, tg = load_split(args.split)
     ks = {'name': args.k_name, 'addr': args.k_addr, 'full': args.k_full}
-    cand = generate_candidates(s1, tg, ks, args.max_df, args.workers)
-    log(f'{len(cand):,} candidate pairs')
-    if args.split != 'test':
-        report_by_pass(args.split, s1, tg, cand)
-    if not args.no_write:
-        write_outputs(args.split, s1, tg, cand)
+    part_dir = generate_candidates(args.split, s1, tg, ks, args.max_df, args.workers)
+    write_outputs(args.split, s1, tg, part_dir, ks)
+    if os.path.exists(config.split_paths(args.split)['gt']):
+        report_by_pass(args.split, tg)
 
 
 if __name__ == '__main__':
