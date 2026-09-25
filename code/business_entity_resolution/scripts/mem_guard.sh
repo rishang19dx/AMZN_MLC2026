@@ -40,6 +40,13 @@ while pgrep -f "$PIPE_PATTERN|$STAGE_PATTERN" > /dev/null; do
         pkill -KILL -f "$PIPE_PATTERN"
         pkill -KILL -f "$STAGE_PATTERN"
         say "stopped. Free memory, then rerun: bash scripts/run_pipeline.sh (finished stages/parts are kept)"
+        if [ "${SHUTDOWN:-0}" = 1 ]; then
+            sync                                   # flush saved parts to disk
+            say "SHUTDOWN=1: powering off in 60 s (cancel: pkill -f mem_guard.sh)"
+            sleep 60
+            sync
+            systemctl poweroff
+        fi
         exit 1
     fi
     sleep "$INTERVAL"
