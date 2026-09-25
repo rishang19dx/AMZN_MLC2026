@@ -120,14 +120,35 @@ def _worker(args):
     return _topk_rows(_SHARED['X'], _SHARED['YT'], k, start, chunk)
 
 
-def topk_sparse(X, Y, k, chunk=2048, workers=1):
+BYTES_PER_NNZ = 24   # sparse product: int64 index + float32 data, plus scipy's temporaries
+
+
+def plan_chunk(X, YT, workers, budget_gb, sample=256):
+    """
+    Rows per chunk so that `workers` simultaneous chunk products fit in
+    budget_gb. Product density grows with the number of targets per country
+    (local_val ~12k non-zeros per row, test ~6-11x that), so a fixed chunk
+    that is fine on local_val runs the laptop out of memory on test.
+    """
+    n = X.shape[0]
+    idx = np.random.default_rng(0).choice(n, min(sample, n), replace=False)
+    nnz_row = max(1.0, (X[idx] @ YT).nnz / len(idx))
+    chunk = int(budget_gb * 1e9 / (workers * nnz_row * BYTES_PER_NNZ))
+    return int(np.clip(chunk, 16, 4096)), nnz_row
+
+
+def topk_sparse(X, Y, k, workers=1, budget_gb=None):
     """
     For each row of X return the k columns of X @ Y.T with the highest score
     (rows are L2-normalised TF-IDF, so scores are cosines). Returns three flat
     arrays (row, col, score); rows with fewer than k non-zero scores return fewer.
-    Row chunks run in parallel in forked worker processes (Linux).
+    Row chunks run in parallel in forked worker processes (Linux), sized to a
+    memory budget (BER_BLOCK_MEM_GB, default 3 GB for all workers together).
     """
     YT = Y.T.tocsr()
+    budget_gb = budget_gb or float(os.environ.get('BER_BLOCK_MEM_GB', 3))
+    chunk, nnz_row = plan_chunk(X, YT, workers, budget_gb)
+    log(f'    product ~{nnz_row:,.0f} non-zeros/row -> {chunk} rows/chunk x {workers} workers')
     jobs = [(s, chunk, k) for s in range(0, X.shape[0], chunk)]
     if workers > 1 and len(jobs) > 1:
         import multiprocessing as mp
