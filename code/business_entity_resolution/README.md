@@ -57,3 +57,22 @@ python src/matching.py
 ```
 
 Your final output files will be generated in `../../output/`.
+
+## Running on Kaggle / Colab
+
+We develop and validate on `local_val` locally, and use the cloud only for GPU stages and full-size (train/test) runs. The code is identical in both places; only paths change, through environment variables read by `src/config.py`:
+
+| Variable | Meaning | Default | Kaggle | Colab |
+|---|---|---|---|---|
+| `BER_DATA_DIR` | raw + split TSVs | `<repo>/dataset` | `/tmp/data` | `/content/data` |
+| `BER_OUTPUT_DIR` | submission files | `<repo>/output` | `/kaggle/working/output` | Drive |
+| `BER_CACHE_DIR` | features, embeddings, checkpoints | `<repo>/cache` | `/tmp/cache` | `/tmp/cache` |
+
+**Getting the data there:** don't upload the raw TSVs. Drive and the Colab Drive mount are slow for large and many files.
+```bash
+bash scripts/pack_data.sh    # -> <repo>/mlc26_data.tar.zst (~0.75 GB, zstd -19) + .sha256
+```
+Upload the archive and its `.sha256` once: as a private Kaggle Dataset `mlc26-data`, and/or to `MyDrive/mlc26/`. Then open `notebooks/cloud_runner.ipynb`. It clones the repo using a `GH_TOKEN` secret and runs `scripts/cloud_setup.sh`, which:
+- copies the archive to the VM's local disk and verifies checksums;
+- installs the requirements while keeping the VM's CUDA torch;
+- regenerates the local splits and checks they are byte-identical to the ones made locally.
