@@ -3,12 +3,16 @@
 #
 #   splits -> native-script dictionary -> blocking -> features -> matcher -> validate
 #
-# Stages whose outputs already exist are skipped (delete them, or pass FORCE=1,
-# to recompute), so a disconnected Kaggle/Colab session can simply be rerun.
+# Stopping and resuming: finished stages are skipped (each writes a completion
+# marker last), and blocking/features also keep their finished parts, so after
+# a stop (Ctrl-C, scripts/mem_guard.sh, a crash) rerunning the same command
+# continues where it stopped. FORCE=1 recomputes everything.
 #
 # Usage (from code/business_entity_resolution/):
-#   bash scripts/run_pipeline.sh              # local_val (train + score) and test (predict)
-#   SPLITS=local_val bash scripts/run_pipeline.sh   # dev loop only
+#   bash scripts/mem_guard.sh &                      # recommended on a shared laptop
+#   bash scripts/run_pipeline.sh                     # local_val (train + score) and test (predict)
+#   SPLITS=local_val bash scripts/run_pipeline.sh    # dev loop only
+#   SHIFT=-0.5 bash scripts/run_pipeline.sh          # stricter decoding for test
 #
 # Decisions baked in (see docs/PIPELINE.md §5):
 #   * the dictionary is learned from local_train only and used for every split,
@@ -25,25 +29,30 @@ CACHE="${BER_CACHE_DIR:-../../cache}"
 OUT="${BER_OUTPUT_DIR:-../../output}"
 
 step() { echo; echo "=== $* ($(date +%H:%M:%S))"; }
-need() { [ "$FORCE" = 1 ] || [ ! -e "$1" ]; }
+# run_unless <marker> <command...>: skip if the marker exists; otherwise run,
+# and let a failure stop the whole pipeline (set -e) instead of continuing.
+run_unless() {
+    local marker="$1"; shift
+    if [ "$FORCE" != 1 ] && [ -e "$marker" ]; then echo "done earlier, skipped"; else "$@"; fi
+}
 
 step "1. local splits"
-need "$DATA/splits/local_val/local_val_ground_truth.tsv" && $PY src/data_loader.py || echo "exists, skipped"
+run_unless "$DATA/splits/local_val/local_val_ground_truth.tsv" $PY src/data_loader.py
 
 step "2. native-script dictionary (from local_train)"
-need "$CACHE/translit.json" && $PY src/translit.py --split local_train || echo "exists, skipped"
+run_unless "$CACHE/translit.json" $PY src/translit.py --split local_train
 
 for s in $SPLITS; do
     step "3. blocking: $s"
-    need "$CACHE/$s/candidates.parquet" && $PY src/blocking.py --split "$s" || echo "exists, skipped"
+    run_unless "$CACHE/$s/blocking.done" $PY src/blocking.py --split "$s"
     step "4. features: $s"
-    need "$CACHE/$s/features/part-000.parquet" && $PY src/features.py --split "$s" || echo "exists, skipped"
+    run_unless "$CACHE/$s/features/_DONE" $PY src/features.py --split "$s"
 done
 
 step "5. matcher: cross-fit score + decoding choice on local_val"
-need "$CACHE/models/decode.json" && $PY src/match.py --split local_val --cv || echo "exists, skipped"
+run_unless "$CACHE/models/decode.json" $PY src/match.py --split local_val --cv
 step "6. matcher: final fit on local_val"
-need "$CACHE/models/stage2.txt" && $PY src/match.py --split local_val --fit || echo "exists, skipped"
+run_unless "$CACHE/models/stage2.txt" $PY src/match.py --split local_val --fit
 
 if [[ " $SPLITS " == *" test "* ]]; then
     step "7. predict test"

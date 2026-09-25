@@ -244,9 +244,8 @@ def build_features(split, chunk):
     truth = load_truth(split)
 
     out_dir = features_dir(split)
-    shutil.rmtree(out_dir, ignore_errors=True)
-    os.makedirs(out_dir)
     import duckdb
+    import json
     # part boundaries on Source 1 changes, roughly `chunk` pairs each
     change = np.r_[0, np.flatnonzero(np.diff(I)) + 1, len(I)]
     bounds, last = [0], 0
@@ -254,7 +253,25 @@ def build_features(split, chunk):
         if b - last >= chunk or b == len(I):
             bounds.append(b)
             last = b
+    # Resumable: parts from an earlier, stopped run over the same candidates are
+    # kept (same pair count and part bounds); anything else starts clean.
+    manifest = {'n_pairs': int(len(I)), 'bounds': [int(b) for b in bounds]}
+    man_path = os.path.join(out_dir, 'manifest.json')
+    try:
+        with open(man_path) as fh:
+            same = json.load(fh) == manifest
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir)
+        with open(man_path, 'w') as fh:
+            json.dump(manifest, fh)
     for part, (s, e) in enumerate(zip(bounds[:-1], bounds[1:])):
+        path = os.path.join(out_dir, f'part-{part:03d}.parquet')
+        if os.path.exists(path):
+            log(f'part {part}: already done, kept')
+            continue
         i, j = I[s:e], J[s:e]
         f = {}
         a, b = list(s1n[i]), list(tgn[j])
@@ -299,8 +316,8 @@ def build_features(split, chunk):
         if truth is not None:
             df['label'] = np.fromiter((t in truth.get(s1, ()) for s1, t in zip(df['s1_id'], df['cand_id'])),
                                       np.int8, len(df))
-        path = os.path.join(out_dir, f'part-{part:03d}.parquet')
-        duckdb.from_df(df).write_parquet(path, compression='zstd')
+        duckdb.from_df(df).write_parquet(path + '.tmp', compression='zstd')
+        os.replace(path + '.tmp', path)      # a stopped run never leaves a half-written part
         log(f'part {part}: {len(df):,} pairs, {df.shape[1] - 4 - (truth is not None)} features -> {path}')
     return len(I)
 
@@ -311,6 +328,8 @@ def main():
     ap.add_argument('--chunk', type=int, default=5_000_000, help='pairs per output part')
     args = ap.parse_args()
     build_features(args.split, args.chunk)
+    # completion marker, written last: run_pipeline.sh only skips features when it exists
+    open(os.path.join(features_dir(args.split), '_DONE'), 'w').close()
     import duckdb
     parts = os.path.join(features_dir(args.split), 'part-*.parquet')
     has_label = 'label' in [r[0] for r in duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{parts}')").fetchall()]

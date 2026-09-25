@@ -199,13 +199,29 @@ def duck(split):
     return con
 
 
+DEFAULT_K = {'name': 0, 'addr': 20, 'full': 30}
+DEFAULT_MAX_DF = 0.02
+
+
+def _readable(path):
+    """A parquet file with a valid footer (i.e. not cut off mid-write)."""
+    import duckdb
+    try:
+        duckdb.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()
+        return True
+    except Exception:
+        return False
+
+
 def generate_candidates(split, s1, tg, ks, max_df, workers=1):
     """Writes one parquet part per (country, pass): columns s1, tg (row indices),
     score_<pass>, rank_<pass>. Returns the part directory."""
     import duckdb
     part_dir = os.path.join(config.CACHE_DIR, split, 'blocking_parts')
-    shutil.rmtree(part_dir, ignore_errors=True)
-    os.makedirs(part_dir)
+    os.makedirs(part_dir, exist_ok=True)
+    # Resumable: a finished (country, pass) part is kept across runs (written to
+    # a temp name, then renamed, so a stopped run never leaves a half part).
+    # Settings are part of the file name, so changed K / max-df recompute.
     for ci, (country, s1_c) in enumerate(s1.groupby('country', sort=False)):
         tg_c = tg[tg['country'] == country]
         if tg_c.empty:
@@ -214,10 +230,17 @@ def generate_candidates(split, s1, tg, ks, max_df, workers=1):
         for pname, (fields, kw) in PASSES.items():
             if ks[pname] <= 0:
                 continue
+            path = os.path.join(part_dir, f'c{ci:02d}_{pname}_k{ks[pname]}_df{max_df:g}.parquet')
+            legacy = os.path.join(part_dir, f'c{ci:02d}_{pname}.parquet')   # older runs, default settings only
+            if os.path.exists(path) or (os.path.exists(legacy) and ks[pname] == DEFAULT_K[pname]
+                                        and max_df == DEFAULT_MAX_DF and _readable(legacy)):
+                log(f'  {country:>8} {pname:>4}: already done, kept')
+                continue
             r, c, v = run_pass(field_text(s1_c, fields), field_text(tg_c, fields), ks[pname], max_df, kw, workers)
             part = pd.DataFrame({'s1': s1_idx[r], 'tg': tg_idx[c],
                                  f'score_{pname}': v, f'rank_{pname}': rank_within(r, v)})
-            duckdb.from_df(part).write_parquet(os.path.join(part_dir, f'c{ci:02d}_{pname}.parquet'))
+            duckdb.from_df(part).write_parquet(path + '.tmp')
+            os.replace(path + '.tmp', path)
             log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
             del part, r, c, v
     return part_dir
@@ -257,6 +280,9 @@ def write_outputs(split, s1, tg, part_dir, ks):
         f.write('source1_entity_id\tcandidate_entity_ids\n')
         while rows := cur.fetchmany(50_000):
             f.writelines(f'{a}\t{b or ""}\n' for a, b in rows)
+    # completion marker, written last: run_pipeline.sh only skips blocking when it exists
+    with open(os.path.join(cache_dir, 'blocking.done'), 'w') as f:
+        f.write(f'{n}\n')
     shutil.rmtree(part_dir, ignore_errors=True)
     shutil.rmtree(os.path.join(cache_dir, 'duckdb_tmp'), ignore_errors=True)
     log(f'wrote {tsv} and {pq}')
@@ -284,10 +310,10 @@ def report_by_pass(split, tg):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--split', default='local_val', choices=config.SPLIT_NAMES)
-    ap.add_argument('--k-name', type=int, default=0, help='0 disables the pass (slow, weak on local_val)')
-    ap.add_argument('--k-addr', type=int, default=20)
-    ap.add_argument('--k-full', type=int, default=30)
-    ap.add_argument('--max-df', type=float, default=0.02,
+    ap.add_argument('--k-name', type=int, default=DEFAULT_K['name'], help='0 disables the pass (slow, weak on local_val)')
+    ap.add_argument('--k-addr', type=int, default=DEFAULT_K['addr'])
+    ap.add_argument('--k-full', type=int, default=DEFAULT_K['full'])
+    ap.add_argument('--max-df', type=float, default=DEFAULT_MAX_DF,
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
     ap.add_argument('--workers', type=int, default=int(os.environ.get('BER_WORKERS', os.cpu_count())))
