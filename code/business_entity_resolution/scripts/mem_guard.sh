@@ -52,3 +52,10 @@ while pgrep -f "$PIPE_PATTERN|$STAGE_PATTERN" > /dev/null; do
     sleep "$INTERVAL"
 done
 say "pipeline finished; guard exiting"
+if [ "${SHUTDOWN_ON_FINISH:-0}" = 1 ]; then
+    sync
+    say "SHUTDOWN_ON_FINISH=1: powering off in 60 s (cancel: pkill -f mem_guard.sh)"
+    sleep 60
+    sync
+    systemctl poweroff
+fi
