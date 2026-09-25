@@ -56,7 +56,9 @@ F0.5 = 1.25·TP / (1.25·TP + 0.25·FN + FP)
    | anyascii | ISC | 73.5 | 0.4% |
    | **Learned dictionary + fallback** | our data | **98.4** | **88.3%** |
 
-   The dictionary covers 97.4% of `local_val` native words. Scripts seen: Devanagari, Kannada, Telugu, Tamil, Bengali, Gujarati, Malayalam, Oriya. A neural transliterator (IndicXlit) isn't needed. anyascii is the fallback; switch from Unidecode only after blocking parameters are frozen.
+   The dictionary covers 97.4% of `local_val` native words. Scripts seen: Devanagari, Kannada, Telugu, Tamil, Bengali, Gujarati, Malayalam, Oriya. A neural transliterator (IndicXlit) isn't needed. anyascii is the fallback.
+
+   **Implemented (26 Sep):** `src/translit.py` learns it from `local_train` ground truth only: 1,363 words, all one-to-one, covering 98.4% of `local_val` native-script word occurrences. `normalize.norm` applies it, with anyascii as the fallback; Unidecode is gone. Effect on blocking: native-script true pairs found 88.5% → 97.8%, F0.5 ceiling 0.9937 → 0.9961 (PIPELINE.md §4).
 
 2. **Variant table mined from train pairs**, using the same alignment: `Ave` → `Avenue`, `OH` → `Ohio`, `Eleventh` → `11th`, `Pvt` → `Private`, `[Inc]` → `Inc`, etc.
 3. **Reverse the generator's artifacts:** leetspeak (`Onc0logy`, `lnvestment`), repeated words (`Mohan Mohan`, `Socienny Socienny`), bracketed legal forms, honorific prefixes (`Smt`, `Shri`), truncation (`(Limite`), website-style names (`tamikod.com`).
@@ -124,7 +126,7 @@ F0.5 = 1.25·TP / (1.25·TP + 0.25·FN + FP)
 ## 7. Open items
 
 - **`train_source1.tsv` timestamp:** it is newer than the other raw files (25 Sep vs 18 Sep). The content looks consistent (row count matches ground truth; CSV quoting pattern matches test). Compare its checksum with the packed Kaggle copy.
-- **Local dependencies not yet in `requirements.txt`:** `sentencepiece==0.2.2` and `protobuf==7.36.2`, required by DeBERTa tokenizers.
+- **Local dependencies not yet in `requirements.txt`:** `sentencepiece==0.2.2` and `protobuf==7.36.2`, required by DeBERTa tokenizers. Add them with the cross-encoder. (`anyascii==0.3.3` has been added.)
 - **Planned France probe:** 2 leaderboard submissions, identical except France is blank in one.
 
 ## Sources

@@ -83,8 +83,11 @@ def read_part(path, feats=None):
     names = [r[0] for r in duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()]
     feats = feats or [c for c in names if c not in NON_FEATURES]
     meta_cols = [c for c in ('s1_idx', 'tg_idx', 'tg_is_s3', 'label') if c in names]
-    d = duckdb.sql(f"SELECT {', '.join(meta_cols + feats)} FROM read_parquet('{path}')").fetchnumpy()
-    meta = {c: np.asarray(d.pop(c)) for c in meta_cols}
+    extra = [c for c in meta_cols if c not in feats]          # tg_is_s3 is also a feature
+    d = duckdb.sql(f"SELECT {', '.join(extra + feats)} FROM read_parquet('{path}')").fetchnumpy()
+    meta = {c: np.asarray(d[c]) for c in meta_cols}
+    for c in extra:
+        d.pop(c)
     X = np.empty((len(meta['s1_idx']), len(feats)), np.float32)
     for k, c in enumerate(feats):
         a = d.pop(c)
@@ -377,6 +380,10 @@ def run_fit(split):
     os.makedirs(MODEL_DIR, exist_ok=True)
     m1.save_model(os.path.join(MODEL_DIR, 'stage1.txt'))
     m2.save_model(os.path.join(MODEL_DIR, 'stage2.txt'))
+    decode_path = os.path.join(MODEL_DIR, 'decode.json')
+    if not os.path.exists(decode_path):   # no --cv run: use the setting --cv chose on local_val
+        with open(decode_path, 'w') as f:
+            json.dump({'method': 'expected_f', 'param': 0.0, 'cv_f05': None, 'split': 'default'}, f, indent=2)
     with open(os.path.join(MODEL_DIR, 'features.json'), 'w') as f:
         json.dump({'stage1': pairs.feats, 'stage2': pairs.feats + CONTEXT, 'trained_on': split}, f, indent=2)
     log(f'saved models to {MODEL_DIR} ({m1.best_iteration} / {m2.best_iteration} trees)')

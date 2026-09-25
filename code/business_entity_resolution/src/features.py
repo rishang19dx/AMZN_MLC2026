@@ -290,7 +290,7 @@ def build_features(split, chunk):
         df.insert(0, 'cand_id', tg_ids[j])
         df.insert(0, 's1_id', s1_ids[i])
         if truth is not None:
-            df['label'] = np.fromiter((t in truth[s1] for s1, t in zip(df['s1_id'], df['cand_id'])),
+            df['label'] = np.fromiter((t in truth.get(s1, ()) for s1, t in zip(df['s1_id'], df['cand_id'])),
                                       np.int8, len(df))
         path = os.path.join(out_dir, f'part-{part:03d}.parquet')
         duckdb.from_df(df).write_parquet(path, compression='zstd')
