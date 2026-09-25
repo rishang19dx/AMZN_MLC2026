@@ -1,3 +1,7 @@
+> **Team:** our pipeline, current status and how to run it are in [`code/business_entity_resolution/README.md`](code/business_entity_resolution/README.md).
+> Progress report: [`docs/REPORT.md`](code/business_entity_resolution/docs/REPORT.md) · task board: [`docs/PIPELINE.md`](code/business_entity_resolution/docs/PIPELINE.md).
+> The rest of this file is the original problem statement.
+
 # ML Challenge 2026 Problem Statement
 
 ## Business Entity Resolution Challenge
