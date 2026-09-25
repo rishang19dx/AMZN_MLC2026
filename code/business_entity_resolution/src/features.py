@@ -51,7 +51,6 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize as l2_normalize
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -150,22 +149,28 @@ class TfidfField:
         vec = TfidfVectorizer(binary=True, norm=None, dtype=np.float32, **kw)
         vec.fit(pd.concat([s1_text, tg_text]))
         self.word = analyzer == 'word'
-        Xw, Yw = vec.transform(s1_text).tocsr(), vec.transform(tg_text).tocsr()
-        self.Xn, self.Yn = l2_normalize(Xw), l2_normalize(Yw)
-        if self.word:
-            self.Xw, self.Yw = Xw, Yw
-            self.Xb, self.Yb = Xw.copy(), Yw.copy()
-            self.Xb.data[:] = 1
-            self.Yb.data[:] = 1
-            self.xs = np.asarray(Xw.sum(axis=1)).ravel()
-            self.ys = np.asarray(Yw.sum(axis=1)).ravel()
+        # One matrix per side (memory: test has ~10M targets). With binary tf, a
+        # shared term has the same weight idf_k on both sides, so for a pair the
+        # element-wise product holds idf_k^2 on shared terms: its sum is the dot
+        # product, and the sum of its square roots is the shared idf mass.
+        self.X, self.Y = vec.transform(s1_text).tocsr(), vec.transform(tg_text).tocsr()
+        self.nx = np.sqrt(np.asarray(self.X.multiply(self.X).sum(axis=1)).ravel())
+        self.ny = np.sqrt(np.asarray(self.Y.multiply(self.Y).sum(axis=1)).ravel())
+        self.xs = np.asarray(self.X.sum(axis=1)).ravel()     # total idf mass per record
+        self.ys = np.asarray(self.Y.sum(axis=1)).ravel()
 
-    def pair_features(self, prefix, i, j):
-        out = {f'{prefix}_cos': pair_rowdot(self.Xn, self.Yn, i, j)}
-        if self.word:
-            with np.errstate(invalid='ignore', divide='ignore'):
-                out[f'{prefix}_cov_s1'] = pair_rowdot(self.Xw, self.Yb, i, j) / self.xs[i]  # Source 1 words in target
-                out[f'{prefix}_cov_tg'] = pair_rowdot(self.Yw, self.Xb, j, i) / self.ys[j]  # target words in Source 1
+    def pair_features(self, prefix, i, j, chunk=1_000_000):
+        dot = np.empty(len(i), np.float32)
+        shared = np.empty(len(i), np.float32)
+        for s in range(0, len(i), chunk):
+            P = self.X[i[s:s + chunk]].multiply(self.Y[j[s:s + chunk]]).tocsr()
+            dot[s:s + chunk] = np.asarray(P.sum(axis=1)).ravel()
+            shared[s:s + chunk] = np.asarray(P.sqrt().sum(axis=1)).ravel()
+        with np.errstate(invalid='ignore', divide='ignore'):
+            out = {f'{prefix}_cos': np.nan_to_num(dot / (self.nx[i] * self.ny[j])).astype(np.float32)}
+            if self.word:
+                out[f'{prefix}_cov_s1'] = (shared / self.xs[i]).astype(np.float32)   # Source 1 words in target
+                out[f'{prefix}_cov_tg'] = (shared / self.ys[j]).astype(np.float32)   # target words in Source 1
         return out
 
 
@@ -228,6 +233,8 @@ def build_features(split, chunk):
     tg_addr_missing = (tg['business_address'].to_numpy() == '').astype(np.float32)
     tg_nonlatin = tg['business_name'].map(is_non_latin).to_numpy().astype(np.float32)
     tg_is_s3 = np.char.startswith(tg_ids.astype(str), 'S3-').astype(np.float32)
+    for df in (s1, tg):     # raw strings are no longer needed (~2 GB on test)
+        df.drop(columns=['business_name', 'business_address', 'country'], inplace=True)
 
     # global counts (need all pairs, not just a part)
     key = pd.factorize(tg['name_n'] + '|' + tg['addr_n'])[0]
