@@ -82,9 +82,18 @@ def record_text(name, addr):
 
 def stage1_p1(split):
     """Stage-1 probabilities in feature-part row order: out-of-fold for the
-    training split (saved by match.py --fit), final model otherwise."""
+    training split (saved by match.py --fit), final model otherwise. On a
+    predicted split (test), match.py --predict's cached stage 1
+    (pred_stage1.npz) is reused instead of re-scoring every pair (~1 h)."""
     from match import MODEL_DIR, predict, read_part
     from features import feature_parts
+    cache = os.path.join(config.CACHE_DIR, split, 'pred_stage1.npz')
+    if os.path.exists(cache) and os.path.getmtime(cache) > os.path.getmtime(os.path.join(MODEL_DIR, 'stage1.txt')):
+        with np.load(cache) as z:
+            meta = {'s1_idx': z['s1_code'].astype(np.int64), 'tg_idx': z['t_code'].astype(np.int64)}
+            p1 = z['p1']
+        log(f'{split}: stage-1 probabilities reused from {cache}')
+        return meta, p1
     with open(os.path.join(MODEL_DIR, 'features.json')) as f:
         fl = json.load(f)
     oof = os.path.join(config.CACHE_DIR, split, 'oof_p1.npy')

@@ -316,7 +316,7 @@ def main():
     ap.add_argument('--max-df', type=float, default=DEFAULT_MAX_DF,
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
-    ap.add_argument('--workers', type=int, default=int(os.environ.get('BER_WORKERS', os.cpu_count())))
+    ap.add_argument('--workers', type=int, default=config.N_THREADS)
     args = ap.parse_args()
 
     s1, tg = load_split(args.split)

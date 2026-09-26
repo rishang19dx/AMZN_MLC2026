@@ -11,6 +11,11 @@ DATA_DIR = os.environ.get('BER_DATA_DIR', os.path.join(BASE_DIR, 'dataset'))
 SPLITS_DIR = os.path.join(DATA_DIR, 'splits')
 CACHE_DIR = os.environ.get('BER_CACHE_DIR', os.path.join(BASE_DIR, 'cache'))
 
+# CPU threads for LightGBM / worker pools. BER_WORKERS caps it on shared
+# machines; otherwise the CPUs this process may use (respects taskset), which
+# equals os.cpu_count() on the laptop.
+N_THREADS = int(os.environ.get('BER_WORKERS', len(os.sched_getaffinity(0))))
+
 IN_COLAB = 'COLAB_RELEASE_TAG' in os.environ
 IN_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
 
