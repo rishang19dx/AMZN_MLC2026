@@ -406,13 +406,33 @@ def run_cv(split):
     np.save(os.path.join(config.CACHE_DIR, split, 'oof_p2.npy'), p2)   # for error analysis
 
 
+def load_oof_p1(split, n):
+    """Out-of-fold stage-1 probabilities saved by an earlier --cv / --fit on the
+    same feature parts (same folds and seeds, so identical to recomputing), or
+    None if missing, the wrong length, or older than the feature parts."""
+    path = os.path.join(config.CACHE_DIR, split, 'oof_p1.npy')
+    if not os.path.exists(path):
+        return None
+    parts = feature_parts(split)
+    if parts and os.path.getmtime(path) < max(os.path.getmtime(x) for x in parts):
+        return None
+    p1 = np.load(path)
+    return p1 if len(p1) == n else None
+
+
 def run_fit(split):
     pairs = Pairs(split)
     all_rows = np.arange(len(pairs))
     folds, es_fold = pairs.row_fold(split, 2, 'mlc26-cv'), pairs.row_fold(split, 10, 'mlc26-es')
-    # stage 2 must be trained on *out-of-fold* stage-1 probabilities, as at test time
-    p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
-    np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
+    # stage 2 must be trained on *out-of-fold* stage-1 probabilities, as at test time.
+    # --cv already computed them with the same folds and seeds: reuse when valid
+    # (saves a full stage-1 cross-fit, ~45 min on scale_val).
+    p1 = load_oof_p1(split, len(pairs))
+    if p1 is None:
+        p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
+        np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
+    else:
+        log('stage 1 out-of-fold probabilities: reused from --cv (oof_p1.npy)')
     full = lgb.Dataset(pairs.X, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
     m1 = fit_on(full, all_rows, es_fold)
     del full
