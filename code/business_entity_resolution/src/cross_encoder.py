@@ -29,6 +29,16 @@ Settings (docs/FINDINGS.md §5): fp16 autocast (never bf16: DeBERTa NaNs),
 max_length 128, one epoch, random swap of the two records, lr 2e-5, linear
 warmup/decay.
 
+Loss (--loss, default listwise; docs/ACCURACY_PLAN.md): pairs are grouped by
+Source 1 (all its positives + its hardest negatives by p1, up to GROUP_MAX),
+and the loss is BCE + LIST_WEIGHT * listwise, where the listwise term is
+-log(sum_pos e^s / sum_all e^s) over each group with a positive. A controlled
+study of cross-encoder training (arXiv 2603.03010) found listwise/pairwise
+objectives beat pointwise ones by about one backbone-size tier, and negative
+quality mattered as much as the loss; candidates competing within a Source 1
+list is also how the matcher decides. BCE is kept so singleton groups (no
+positive) still train and the logit stays probability-like for stage 2.
+
 Usage
   python src/cross_encoder.py export --split ce_train
   python src/cross_encoder.py export --split local_val
@@ -53,6 +63,8 @@ import config
 MODEL_NAME = 'microsoft/mdeberta-v3-base'
 BAND_LO, BAND_HI = 0.02, 0.98
 EASY_SAMPLE = 0.10          # share of out-of-band ce_train pairs kept for training
+GROUP_MAX = 16              # pairs per Source 1 group (all positives + hardest negatives)
+LIST_WEIGHT = 1.0           # weight of the listwise term next to BCE
 CE_DIR = os.path.join(config.CACHE_DIR, 'ce')
 
 
@@ -137,6 +149,51 @@ def _batches(df, tok, bs, shuffle, swap, rng):
         yield enc, (None if y is None else y[k])
 
 
+def make_groups(df, group_max=GROUP_MAX):
+    """Row-index arrays, one per Source 1: all positives first, then negatives
+    by descending p1 (hardest first), capped at group_max."""
+    order = np.lexsort((-df['p1'].to_numpy(), -df['label'].to_numpy(), df['s1_idx'].to_numpy()))
+    s1 = df['s1_idx'].to_numpy()[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(s1)) + 1, len(s1)]
+    return [order[a:min(b, a + group_max)] for a, b in zip(starts[:-1], starts[1:])]
+
+
+def _group_batches(df, groups, tok, bs, rng):
+    """Whole groups packed into batches of about `bs` pairs, random order and swap."""
+    a, b = df['text_a'].to_numpy(), df['text_b'].to_numpy()
+    y = df['label'].to_numpy(np.float32)
+    batch, gid = [], []
+    for g in rng.permutation(len(groups)):
+        batch.append(groups[g])
+        if sum(len(x) for x in batch) >= bs:
+            yield _encode_groups(batch, a, b, y, tok, rng)
+            batch = []
+    if batch:
+        yield _encode_groups(batch, a, b, y, tok, rng)
+
+
+def _encode_groups(batch, a, b, y, tok, rng):
+    k = np.concatenate(batch)
+    gid = np.concatenate([np.full(len(x), n) for n, x in enumerate(batch)])
+    ta, tb = a[k], b[k]
+    flip = rng.random(len(k)) < 0.5
+    ta, tb = np.where(flip, tb, ta), np.where(flip, ta, tb)
+    enc = tok(list(ta), list(tb), truncation=True, max_length=128, padding=True, return_tensors='pt')
+    return enc, y[k], gid
+
+
+def listwise_loss(logits, y, gid):
+    """Mean over groups with >=1 positive of -log(sum_pos e^s / sum_all e^s)."""
+    import torch
+    terms = []
+    for g in torch.unique(gid):
+        m = gid == g
+        s, t = logits[m], y[m]
+        if t.sum() > 0:
+            terms.append(torch.logsumexp(s, 0) - torch.logsumexp(s[t > 0], 0))
+    return torch.stack(terms).mean() if terms else logits.sum() * 0.0
+
+
 def _device():
     import torch
     return 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -148,20 +205,30 @@ def _autocast(dev):
     return torch.autocast('cuda', dtype=torch.float16) if dev == 'cuda' else torch.autocast('cpu', enabled=False)
 
 
-def train(epochs=1, bs=32, lr=2e-5, max_pairs=None, model_name=MODEL_NAME):
+def train(epochs=1, bs=32, lr=2e-5, max_pairs=None, model_name=MODEL_NAME, loss='listwise'):
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
     import duckdb
-    df = duckdb.sql(f"SELECT text_a, text_b, label FROM read_parquet('{os.path.join(CE_DIR, 'ce_train.parquet')}')").df()
+    df = duckdb.sql(f"SELECT s1_idx, p1, text_a, text_b, label FROM read_parquet('{os.path.join(CE_DIR, 'ce_train.parquet')}')").df()
     if max_pairs and len(df) > max_pairs:
-        df = df.sample(max_pairs, random_state=26)
+        if loss == 'listwise':      # sample whole Source 1 groups, not pairs
+            s1 = df['s1_idx'].unique()
+            keep = np.random.default_rng(26).permutation(s1)[:max(1, int(len(s1) * max_pairs / len(df)))]
+            df = df[df['s1_idx'].isin(keep)].reset_index(drop=True)
+        else:
+            df = df.sample(max_pairs, random_state=26).reset_index(drop=True)
+    groups = make_groups(df) if loss == 'listwise' else None
+    if groups is not None:
+        log(f'{len(groups):,} Source 1 groups, {sum(len(g) for g in groups):,} pairs '
+            f'(of {len(df):,}; cap {GROUP_MAX} per group)')
     dev = _device()
     tok = AutoTokenizer.from_pretrained(model_name)
     # 1 output = match logit; replaces any existing classification head of the checkpoint
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=1, ignore_mismatched_sizes=True).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    steps = epochs * ((len(df) + bs - 1) // bs)
+    n_pairs = sum(len(g) for g in groups) if groups is not None else len(df)
+    steps = epochs * ((n_pairs + bs - 1) // bs)
     sched = get_linear_schedule_with_warmup(opt, int(0.06 * steps), steps)
     scaler = (torch.amp.GradScaler('cuda') if hasattr(torch.amp, 'GradScaler') else torch.cuda.amp.GradScaler()) \
         if dev == 'cuda' else None
@@ -170,11 +237,16 @@ def train(epochs=1, bs=32, lr=2e-5, max_pairs=None, model_name=MODEL_NAME):
     model.train()
     step, t0 = 0, time.time()
     for _ in range(epochs):
-        for enc, y in _batches(df, tok, bs, shuffle=True, swap=True, rng=rng):
+        it = _group_batches(df, groups, tok, bs, rng) if groups is not None else \
+            ((e, t, None) for e, t in _batches(df, tok, bs, shuffle=True, swap=True, rng=rng))
+        for enc, y, gid in it:
             enc = {k: v.to(dev) for k, v in enc.items()}
             with _autocast(dev):
                 logits = model(**enc).logits.squeeze(-1)
-            loss = loss_fn(logits.float(), torch.from_numpy(y).to(dev))
+            yt = torch.from_numpy(y).to(dev)
+            loss = loss_fn(logits.float(), yt)
+            if gid is not None:
+                loss = loss + LIST_WEIGHT * listwise_loss(logits.float(), yt, torch.from_numpy(gid).to(dev))
             opt.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -228,11 +300,13 @@ def main():
     ap.add_argument('--split', choices=config.SPLIT_NAMES)
     ap.add_argument('--max-pairs', type=int, default=None, help='cap on training pairs (train mode)')
     ap.add_argument('--model', default=MODEL_NAME, help='base checkpoint (train mode); tiny models for smoke tests')
+    ap.add_argument('--loss', choices=['listwise', 'bce'], default='listwise',
+                    help='listwise: BCE + per-Source-1 listwise term (default); bce: pointwise only')
     args = ap.parse_args()
     if args.mode == 'export':
         export(args.split)
     elif args.mode == 'train':
-        train(max_pairs=args.max_pairs, model_name=args.model)
+        train(max_pairs=args.max_pairs, model_name=args.model, loss=args.loss)
     else:
         score(args.split)
 
