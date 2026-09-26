@@ -61,7 +61,11 @@ _NUM = re.compile(r'\d+')
 
 
 def log(msg, t0=[time.time()]):
-    print(f'[{time.time() - t0[0]:7.1f}s] {msg}', flush=True)
+    # current / peak resident memory: test runs close to the laptop's RAM limit
+    import resource
+    rss = int(open('/proc/self/statm').read().split()[1]) * os.sysconf('SC_PAGE_SIZE') / 2**30
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+    print(f'[{time.time() - t0[0]:7.1f}s] {msg}   [mem {rss:.1f} GB, peak {peak:.1f} GB]', flush=True)
 
 
 def features_dir(split):
@@ -80,21 +84,78 @@ def feature_parts(split):
 # ---------------------------------------------------------------------------
 
 def load_records(split):
+    """
+    Streams the source files and keeps only what the features need: entity_id,
+    normalised name and address, and two flags computed from the raw text.
+    Raw columns are never held for the whole split (test: 11.7M records; the
+    pandas version sat at 5.9 GB, and freed Python strings are not returned to
+    the OS). Reads exactly like read_tsv: tab-split, no quote handling.
+    """
     p = config.split_paths(split)
-    s1 = read_tsv(p['s1'])
-    tg = pd.concat([read_tsv(p['s2']), read_tsv(p['s3'])], ignore_index=True)
-    for df in (s1, tg):
-        df['name_n'] = df['business_name'].map(norm)
-        df['addr_n'] = df['business_address'].map(norm)
-    return s1, tg
+
+    def read(paths):
+        ids, names, addrs, missing, nonlatin = [], [], [], [], []
+        for path in paths:
+            with open(path, encoding='utf-8') as f:
+                header = next(f).rstrip('\n').split('\t')
+                assert header[:3] == ['entity_id', 'business_name', 'business_address'], header
+                for line in f:
+                    if line == '\n':
+                        continue
+                    eid, name, addr = line.rstrip('\n').split('\t')[:3]
+                    ids.append(eid)
+                    names.append(norm(name))
+                    addrs.append(norm(addr))
+                    missing.append(addr == '')
+                    nonlatin.append(is_non_latin(name))
+        return pd.DataFrame({
+            'entity_id': np.array(ids, dtype=object), 'name_n': names, 'addr_n': addrs,
+            'addr_missing': np.array(missing, np.float32), 'nonlatin': np.array(nonlatin, np.float32)})
+
+    return read([p['s1']]), read([p['s2'], p['s3']])
+
+
+def _index_path(split):
+    return os.path.join(config.CACHE_DIR, split, 'cand_index.npz')
 
 
 def load_candidate_index(split, s1_ids, tg_ids):
-    """Candidate pairs as integer row indices into s1 / tg, sorted by Source 1."""
+    """Candidate pairs as integer row indices into s1 / tg, sorted by Source 1.
+    Cached in cand_index.npz (built by --index-only in its own process on test,
+    so the ID join never stacks on top of the records and TF-IDF matrices)."""
+    cached = _index_path(split)
+    cands = os.path.join(config.CACHE_DIR, split, 'candidates.parquet')
+    if os.path.exists(cached) and os.path.getmtime(cached) >= os.path.getmtime(cands):
+        with np.load(cached) as z:
+            out = {k: z[k] for k in z.files}
+        if len(out['i']) and out['i'].max() < len(s1_ids) and out['j'].max() < len(tg_ids):
+            return out
+    out = _join_candidate_index(split, s1_ids, tg_ids)
+    np.savez(cached + '.tmp.npz', **out)
+    os.replace(cached + '.tmp.npz', cached)
+    return out
+
+
+def _read_ids(paths):
+    ids = []
+    for path in paths:
+        with open(path, encoding='utf-8') as f:
+            next(f)
+            ids.extend(line.split('\t', 1)[0] for line in f if line != '\n')
+    return np.array(ids, dtype=object)
+
+
+def _join_candidate_index(split, s1_ids, tg_ids):
     import duckdb
     con = duckdb.connect()
-    con.register('s1x', pd.DataFrame({'id': s1_ids, 'i': np.arange(len(s1_ids), dtype=np.int64)}))
-    con.register('tgx', pd.DataFrame({'id': tg_ids, 'j': np.arange(len(tg_ids), dtype=np.int64)}))
+    # Capped memory + spill directory: uncapped, this join of ~65M test pairs
+    # against ID strings peaked above the laptop's free RAM and was OOM-killed.
+    tmp = os.path.join(config.CACHE_DIR, split, 'duckdb_tmp')
+    os.makedirs(tmp, exist_ok=True)
+    con.execute(f"SET memory_limit='{os.environ.get('BER_DUCKDB_MEM', '3GB')}'")
+    con.execute(f"SET temp_directory='{tmp}'")
+    con.register('s1x', pd.DataFrame({'id': s1_ids, 'i': np.arange(len(s1_ids), dtype=np.int32)}))
+    con.register('tgx', pd.DataFrame({'id': tg_ids, 'j': np.arange(len(tg_ids), dtype=np.int32)}))
     path = os.path.join(config.CACHE_DIR, split, 'candidates.parquet')
     d = con.sql(f"""
         SELECT s1x.i, tgx.j, c.score_addr, c.rank_addr, c.score_full, c.rank_full
@@ -104,9 +165,11 @@ def load_candidate_index(split, s1_ids, tg_ids):
     out = {}
     for k, a in d.items():
         a = a.filled(np.nan) if np.ma.isMaskedArray(a) else a
-        out[k] = a.astype(np.int64 if k in ('i', 'j') else np.float32)
+        out[k] = a.astype(np.int32 if k in ('i', 'j') else np.float32)   # int32: 65M pairs x 2 saves 0.5 GB
     n_cand = con.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
     assert len(out['i']) == n_cand, 'some candidate IDs are missing from the split files'
+    con.close()
+    shutil.rmtree(tmp, ignore_errors=True)
     return out
 
 
@@ -136,6 +199,84 @@ def pair_rowdot(X, Y, i, j, chunk=1_000_000):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Memory-bounded TF-IDF (test: ~11.7M records). sklearn's fit() builds a count
+# matrix over every record just to learn IDF, and transform() then builds it
+# again; together with the other in-memory arrays that exceeded the laptop's
+# RAM. Here document frequencies are counted chunk by chunk and the final
+# matrices are assembled into preallocated arrays. The IDF formula is sklearn's
+# own (smooth_idf, float32), so features are unchanged up to float rounding.
+# ---------------------------------------------------------------------------
+
+def _fit_streaming(s1_text, tg_text, kw, chunk=1_000_000):
+    from sklearn.feature_extraction.text import CountVectorizer
+    df_counts, n = {}, 0
+    for series in (s1_text, tg_text):
+        for a in range(0, len(series), chunk):
+            part = series.iloc[a:a + chunk]
+            cv = CountVectorizer(binary=True, dtype=np.float32, **kw)
+            try:
+                m = cv.fit_transform(part)
+            except ValueError:      # chunk with no terms at all
+                n += len(part)
+                continue
+            df = np.bincount(m.indices, minlength=m.shape[1])
+            for term, k in cv.vocabulary_.items():
+                df_counts[term] = df_counts.get(term, 0) + int(df[k])
+            n += len(part)
+            del m, cv
+    terms = sorted(df_counts)
+    vec = TfidfVectorizer(vocabulary={t: k for k, t in enumerate(terms)},
+                          binary=True, norm=None, dtype=np.float32, **kw)
+    vec.fit([''])                   # sets up the vocabulary; idf_ is replaced below
+    df = np.fromiter((df_counts[t] for t in terms), np.float32, len(terms))
+    del df_counts
+    df += 1.0                       # sklearn: smooth_idf
+    idf = np.full_like(df, fill_value=n + 1, dtype=np.float32)
+    idf /= df
+    np.log(idf, out=idf)
+    idf += 1
+    vec.idf_ = idf
+    return vec
+
+
+def _transform_chunked(vec, text, chunk=500_000):
+    import scipy.sparse as sp
+    datas, inds, lens = [], [], []
+    for a in range(0, len(text), chunk):
+        m = vec.transform(text.iloc[a:a + chunk]).tocsr()
+        m.sort_indices()
+        datas.append(m.data.astype(np.float32, copy=False))
+        inds.append(m.indices.astype(np.int32, copy=False))
+        lens.append(np.diff(m.indptr))
+        del m
+    nnz = sum(len(d) for d in datas)
+    data, indices = np.empty(nnz, np.float32), np.empty(nnz, np.int32)
+    pos = 0
+    for k in range(len(datas)):     # copy chunk by chunk, freeing as we go
+        e = pos + len(datas[k])
+        data[pos:e], indices[pos:e] = datas[k], inds[k]
+        datas[k] = inds[k] = None
+        pos = e
+    indptr = np.zeros(len(text) + 1, np.int64)
+    np.cumsum(np.concatenate(lens), out=indptr[1:])
+    return sp.csr_matrix((data, indices, indptr), shape=(len(text), len(vec.vocabulary_)))
+
+
+def _row_sums(m, square=False, chunk=1_000_000):
+    out = np.zeros(m.shape[0], np.float32)
+    for a in range(0, m.shape[0], chunk):
+        b = min(a + chunk, m.shape[0])
+        lo, hi = m.indptr[a], m.indptr[b]
+        d = m.data[lo:hi]
+        if square:
+            d = d * d
+        seg = np.diff(m.indptr[a:b + 1])
+        rows = np.repeat(np.arange(b - a), seg)
+        out[a:b] = np.bincount(rows, weights=d, minlength=b - a)
+    return out
+
+
 class TfidfField:
     """
     Binary IDF vectors of one field for Source 1 and targets. IDF is fitted on
@@ -146,18 +287,17 @@ class TfidfField:
     def __init__(self, s1_text, tg_text, analyzer):
         kw = dict(analyzer='char_wb', ngram_range=(3, 3)) if analyzer == 'char' else \
             dict(analyzer='word', token_pattern=r'\S+')
-        vec = TfidfVectorizer(binary=True, norm=None, dtype=np.float32, **kw)
-        vec.fit(pd.concat([s1_text, tg_text]))
+        vec = _fit_streaming(s1_text, tg_text, kw)
         self.word = analyzer == 'word'
         # One matrix per side (memory: test has ~10M targets). With binary tf, a
         # shared term has the same weight idf_k on both sides, so for a pair the
         # element-wise product holds idf_k^2 on shared terms: its sum is the dot
         # product, and the sum of its square roots is the shared idf mass.
-        self.X, self.Y = vec.transform(s1_text).tocsr(), vec.transform(tg_text).tocsr()
-        self.nx = np.sqrt(np.asarray(self.X.multiply(self.X).sum(axis=1)).ravel())
-        self.ny = np.sqrt(np.asarray(self.Y.multiply(self.Y).sum(axis=1)).ravel())
-        self.xs = np.asarray(self.X.sum(axis=1)).ravel()     # total idf mass per record
-        self.ys = np.asarray(self.Y.sum(axis=1)).ravel()
+        self.X, self.Y = _transform_chunked(vec, s1_text), _transform_chunked(vec, tg_text)
+        self.nx = np.sqrt(_row_sums(self.X, square=True))
+        self.ny = np.sqrt(_row_sums(self.Y, square=True))
+        self.xs = _row_sums(self.X)     # total idf mass per record
+        self.ys = _row_sums(self.Y)
 
     def pair_features(self, prefix, i, j, chunk=1_000_000):
         dot = np.empty(len(i), np.float32)
@@ -174,8 +314,11 @@ class TfidfField:
         return out
 
 
-def _nums(s):
-    return frozenset(t.lstrip('0') or '0' for t in _NUM.findall(s))
+def _nums(s, _cache={}):
+    # unique numbers as a shared, deduplicated tuple (frozensets for 11.7M test
+    # records cost several GB); set semantics are kept in number_features
+    t = tuple(sorted({x.lstrip('0') or '0' for x in _NUM.findall(s)}))
+    return _cache.setdefault(t, t)
 
 
 def _house(s):
@@ -194,8 +337,8 @@ def number_features(s1_nums, tg_nums, s1_house, i, j):
         if h and b:
             hn_in[k] = h in b
         if a and b:
-            frac_in[k] = len(a & b) / len(a)
-        extra[k] = len(b - a)
+            frac_in[k] = sum(1 for x in a if x in b) / len(a)      # |a & b| / |a|
+        extra[k] = sum(1 for x in b if x not in a)                  # |b - a|
     return {
         'num_house_in_tg': hn_in,          # NaN when either side has no number
         'num_frac_s1_in_tg': frac_in,
@@ -213,16 +356,17 @@ def build_features(split, chunk):
     s1, tg = load_records(split)
     log(f'records: S1 {len(s1):,}, targets {len(tg):,}')
     s1_ids, tg_ids = s1['entity_id'].to_numpy(), tg['entity_id'].to_numpy()
+    tg_addr_missing, tg_nonlatin = tg['addr_missing'].to_numpy(), tg['nonlatin'].to_numpy()
+    tg_is_s3 = np.fromiter((t.startswith('S3-') for t in tg_ids), np.float32, len(tg_ids))
+    fields = {}
+    for name, col, analyzer in (('namew', 'name_n', 'word'), ('namec', 'name_n', 'char'), ('addrw', 'addr_n', 'word')):
+        fields[name] = TfidfField(s1[col], tg[col], analyzer)
+        log(f'tf-idf {name}: {fields[name].X.shape[1]:,} terms, {fields[name].X.nnz + fields[name].Y.nnz:,} nonzeros')
+    log('tf-idf fitted')
+
     c = load_candidate_index(split, s1_ids, tg_ids)
     I, J = c['i'], c['j']
     log(f'candidates: {len(I):,}')
-
-    fields = {
-        'namew': TfidfField(s1['name_n'], tg['name_n'], 'word'),
-        'namec': TfidfField(s1['name_n'], tg['name_n'], 'char'),
-        'addrw': TfidfField(s1['addr_n'], tg['addr_n'], 'word'),
-    }
-    log('tf-idf fitted')
 
     s1n, tgn = s1['name_n'].to_numpy(), tg['name_n'].to_numpy()
     s1a, tga = s1['addr_n'].to_numpy(), tg['addr_n'].to_numpy()
@@ -230,14 +374,12 @@ def build_features(split, chunk):
     s1_house = [_house(s) for s in s1a]
     ntok = lambda arr: np.fromiter((len(s.split()) for s in arr), np.float32, len(arr))
     s1_name_ntok, tg_name_ntok, s1_addr_ntok, tg_addr_ntok = ntok(s1n), ntok(tgn), ntok(s1a), ntok(tga)
-    tg_addr_missing = (tg['business_address'].to_numpy() == '').astype(np.float32)
-    tg_nonlatin = tg['business_name'].map(is_non_latin).to_numpy().astype(np.float32)
-    tg_is_s3 = np.char.startswith(tg_ids.astype(str), 'S3-').astype(np.float32)
-    for df in (s1, tg):     # raw strings are no longer needed (~2 GB on test)
-        df.drop(columns=['business_name', 'business_address', 'country'], inplace=True)
 
     # global counts (need all pairs, not just a part)
-    key = pd.factorize(tg['name_n'] + '|' + tg['addr_n'])[0]
+    # duplicate groups = identical (name, address); from two integer codes, not a
+    # concatenated 10M-string column
+    kn, ka = pd.factorize(tg['name_n'])[0], pd.factorize(tg['addr_n'])[0]
+    key = pd.factorize(kn.astype(np.int64) * (int(ka.max()) + 1) + ka)[0]
     dup_size = np.bincount(key)
     hub = np.bincount(J, minlength=len(tg))
     list_n = np.bincount(I, minlength=len(s1))
@@ -325,8 +467,17 @@ def build_features(split, chunk):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--split', default='local_val', choices=config.SPLIT_NAMES)
-    ap.add_argument('--chunk', type=int, default=5_000_000, help='pairs per output part')
+    ap.add_argument('--chunk', type=int, default=int(os.environ.get('BER_FEATURE_CHUNK', 5_000_000)),
+                    help='pairs per output part; peak memory grows ~0.65 GB per 1M (env BER_FEATURE_CHUNK)')
+    ap.add_argument('--index-only', action='store_true',
+                    help='only build the cached candidate index (low memory; run before a big split)')
     args = ap.parse_args()
+    if args.index_only:
+        p = config.split_paths(args.split)
+        s1_ids, tg_ids = _read_ids([p['s1']]), _read_ids([p['s2'], p['s3']])
+        n = len(load_candidate_index(args.split, s1_ids, tg_ids)['i'])
+        log(f'candidate index: {n:,} pairs -> {_index_path(args.split)}')
+        return
     build_features(args.split, args.chunk)
     # completion marker, written last: run_pipeline.sh only skips features when it exists
     open(os.path.join(features_dir(args.split), '_DONE'), 'w').close()

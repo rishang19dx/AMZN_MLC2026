@@ -303,14 +303,14 @@ def decode(s1_code, t_code, src, p, method, param):
 # Output and scoring
 # ---------------------------------------------------------------------------
 
-def write_matches(split, s1_code, t_code, chosen):
+def write_matches(split, s1_code, t_code, chosen, name='matching_results.tsv'):
     s1_ids, tg_ids = split_ids(split)
     sel = pd.DataFrame({'s1': s1_code[chosen], 'cand_id': tg_ids[t_code[chosen]]})
     lists = sel.groupby('s1')['cand_id'].agg(lambda x: ','.join(sorted(x)))
     lists = lists.reindex(np.arange(len(s1_ids)), fill_value='')   # every Source 1 gets a row
     out_dir = os.path.join(config.OUTPUT_DIR, split)
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, 'matching_results.tsv')
+    path = os.path.join(out_dir, name)
     with open(path, 'w', encoding='utf-8') as f:
         f.write('source1_entity_id\tmatched_entity_ids\n')
         for s1_id, ids in zip(s1_ids, lists.to_numpy()):
@@ -465,10 +465,29 @@ def run_predict(split, shift=None):
         off += n
     del ctx
     log('stage 2 done')
+    # Saved so decoding variants (--redecode) take minutes instead of a full predict.
+    pred = os.path.join(config.CACHE_DIR, split, 'pred.npz')
+    np.savez(pred + '.tmp.npz', s1_code=s1_code.astype(np.int32), t_code=t_code.astype(np.int32),
+             src=src.astype(np.int8), p2=p2)
+    os.replace(pred + '.tmp.npz', pred)
+    log(f'saved probabilities -> {pred}')
     param = choice['param'] if shift is None or choice['method'] == 'threshold' else shift
     chosen = decode(s1_code, t_code, src, p2, choice['method'], param)
     path = write_matches(split, s1_code, t_code, chosen)
     log(f'{int(chosen.sum()):,} matches ({choice["method"]}, param {param}) -> {path}')
+
+
+def run_redecode(split, shift):
+    """Re-decode saved --predict probabilities with another logit shift; writes
+    matching_results_shift<shift>.tsv next to the main file (which stays untouched)."""
+    with open(os.path.join(MODEL_DIR, 'decode.json')) as f:
+        choice = json.load(f)
+    with np.load(os.path.join(config.CACHE_DIR, split, 'pred.npz')) as z:
+        s1_code, t_code, src, p2 = (z[k] for k in ('s1_code', 't_code', 'src', 'p2'))
+    param = choice['param'] if shift is None else shift
+    chosen = decode(s1_code.astype(np.int64), t_code.astype(np.int64), src, p2, choice['method'], param)
+    path = write_matches(split, s1_code, t_code, chosen, name=f'matching_results_shift{param:+.2f}.tsv')
+    log(f'{int(chosen.sum()):,} matches ({choice["method"]}, shift {param:+.2f}) -> {path}')
 
 
 def main():
@@ -478,6 +497,8 @@ def main():
     mode.add_argument('--cv', action='store_true')
     mode.add_argument('--fit', action='store_true')
     mode.add_argument('--predict', action='store_true')
+    mode.add_argument('--redecode', action='store_true',
+                      help='re-decode saved --predict probabilities with --shift (minutes, no model run)')
     ap.add_argument('--shift', type=float, default=None,
                     help='override the logit shift for expected-F decoding at predict time (negative = stricter)')
     args = ap.parse_args()
@@ -485,6 +506,8 @@ def main():
         run_cv(args.split)
     elif args.fit:
         run_fit(args.split)
+    elif args.redecode:
+        run_redecode(args.split, args.shift)
     else:
         run_predict(args.split, args.shift)
 
