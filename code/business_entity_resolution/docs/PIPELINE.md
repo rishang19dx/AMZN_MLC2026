@@ -19,7 +19,7 @@ This is the living handoff doc. For background and the history of what was built
 | Matcher | `match.py` | Precise, calibrated | two-stage LightGBM with list and competition context. `--predict` saves `cache/<split>/pred.npz`; `--redecode --shift=X` rebuilds a decoding variant in ~6 min | ✅ cross-fit on `local_val`: **F0.5 0.9858**. ⚠️ **public LB 0.9334**: the model is trained on a 9× smaller universe than test (§4b). ✅ test predict: 36 min, 11.6 GB peak |
 | Assignment + decoding | `match.py` | Each target → ≤1 S1; F0.5-optimal set per S1 | one S1 per target, per-source caps, expected-F0.5 decoding | ✅ `tests/test_match.py`; measured in §4 |
 | Cross-encoder | `cross_encoder.py`, `notebooks/kaggle_cross_encoder.ipynb` | MIT/Apache, ≤8B params | mDeBERTa-v3-base trained on the `ce_train` split (disjoint from `local_val` and test), band-only scoring, auto-used by `match.py` stage 2 when `ce_scores.parquet` exists | ✅ train/score smoke-tested on CPU with a tiny model. ❌ not yet trained on the T4 |
-| Test-scale split | `data_loader.py --scale-val` | Train/score the matcher with test-like crowding | `scale_val`: 377,423 `local_train` Source 1 (not `ce_train`'s) against **all 9.29M** `local_train` targets | ⏳ blocking running (Sat 17:27) |
+| Test-scale split | `data_loader.py --scale-val` | Train/score the matcher with test-like crowding | `scale_val`: 377,423 `local_train` Source 1 (not `ce_train`'s) against **all 9.29M** `local_train` targets | ✅ blocking (56 min, 7.0 GB peak): 14,448,194 pairs, **96.9%** of true pairs kept, ceiling **0.989**. ⏳ features (Sat 19:33) |
 | Package | `scripts/run_pipeline.sh`, `utils/validate_submission.py`, `Documentation_template.md` | Zip; outputs reproducible from data using only the package | end-to-end script done | ✅ full chain + validator **PASS** on a small test sample. ❌ not yet on the full test set; docs and zip TODO |
 
 Legacy code (`blocking_legacy.py`, `matching.py`, `preprocess.py`) was removed on Sat 26 Sep; it is in git history.
@@ -105,7 +105,19 @@ Why: `local_val` is a ~9× smaller universe than test, so test candidates are fa
 | blocking score (full pass) | 0.28 | 0.38 | 1.37 |
 | RapidFuzz address token-set (IDF-independent) | 0.57 | 0.72 | 1.28 |
 
-The IDF-independent row shows it is genuine crowding, not only IDF drift. Fix in progress: retrain and score on `scale_val` (test-sized target pool). The `local_val` 0.9858 remains an honest number for a small universe, not a leaderboard estimate.
+The IDF-independent row shows it is genuine crowding, not only IDF drift.
+
+**Blocking at test scale** (`scale_val`: same K and settings, test-sized target pool, measured against ground truth):
+
+| | `local_val` | `scale_val` |
+|---|---|---|
+| true pairs kept | 98.8% | **96.9%** |
+| India / US | 97.9% / 99.4% | **94.8%** / 98.3% |
+| entities with every match kept | 96.3% | **90.9%** (India 85.6%) |
+| F0.5 ceiling | 0.996 | **0.989** |
+| candidates per Source 1 (mean / max) | 37.7 / 50 | 38.3 / 50 |
+
+The fixed top-K loses true pairs to look-alikes when the pool is test-sized, mostly in India. This explains about **0.007** of the gap; the rest is the matcher. Lever: larger K for India's passes, sized after the `scale_val` matcher retrain. Fix in progress: retrain and score on `scale_val` (test-sized target pool). The `local_val` 0.9858 remains an honest number for a small universe, not a leaderboard estimate.
 
 ## 5. Decisions (and why)
 
@@ -134,7 +146,7 @@ The IDF-independent row shows it is genuine crowding, not only IDF drift. Fix in
 | T7 | Error analysis on `local_val` out-of-fold predictions (`cache/local_val/oof_p2.npy`, row order = feature parts): missed pairs vs. false matches by bucket | | – | open |
 | T8 | Final: clean run, `validate_submission.py`, `Documentation_template.md`, zip | | freeze | open |
 | T9 | France probe submissions | Rishang | T5 | ✅ France ≈ 0.874, US/India ≈ 0.944 (§4b) |
-| T10 | `scale_val`: blocking → features → `match.py --cv` → `--fit` → test `--predict` | Rishang (local) | – | ⏳ blocking running |
+| T10 | `scale_val`: blocking → features → `match.py --cv` → `--fit` → test `--predict` | Rishang (local) | – | ✅ blocking (recall 96.9%, ceiling 0.989); ⏳ features |
 
 ## 7. Submission log
 
