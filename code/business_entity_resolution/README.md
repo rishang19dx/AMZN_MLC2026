@@ -13,11 +13,13 @@ For each Source 1 (S1) business, find every matching S2/S3 record. Scored by F0.
 | 2 | Local scorer | `src/evaluate.py` | ✅ done | reproduces the leaderboard F0.5; unit tests pass |
 | 3 | Cloud runner (Kaggle / Colab) | `scripts/`, `notebooks/cloud_runner.ipynb` | ✅ done | rehearsed locally; ❌ not yet run on a real Kaggle machine |
 | 4 | Blocking v1 | `src/blocking.py` | ✅ done | `local_val`: **98.2% of true pairs found, F0.5 ceiling 0.994**, 38 candidates per S1; ❌ test runtime not yet measured |
-| 5 | Matcher v1 (features + LightGBM + assignment + threshold) | `src/features.py`, `src/match.py` | ⏳ TODO | – |
-| 6 | Cross-encoder (mDeBERTa-v3, stacked into the matcher) | `src/cross_encoder.py` | ⏳ TODO | – |
-| 7 | Submission package (validator, docs, zip) | – | ⏳ TODO | – |
+| 5 | Native-script dictionary + anyascii | `src/translit.py`, `src/normalize.py` | ✅ done | blocking recall 98.2% → **98.8%**; native-script names 88.5% → 97.8% |
+| 6 | Matcher (features + two-stage LightGBM + one S1 per target + expected-F0.5 decoding) | `src/features.py`, `src/match.py` | ✅ done | `local_val` out-of-fold **F0.5 0.9858** (India 0.9835, US 0.9874) |
+| 7 | Full test run → Submission 1 | `scripts/run_pipeline.sh` | ⏳ running (Sat 26 Sep, 02:08) | – |
+| 8 | Cross-encoder (mDeBERTa-v3, stage-2 feature) | `src/cross_encoder.py`, `notebooks/kaggle_cross_encoder.ipynb` | code done; ⏳ T4 training | – |
+| 9 | Submission package (validator, docs, zip) | – | ⏳ TODO | – |
 
-No leaderboard submission yet. `matching.py`, `preprocess.py` and `blocking_legacy.py` are **legacy**, kept for reference only; don't build on them.
+`matching.py`, `preprocess.py` and `blocking_legacy.py` are **legacy**, kept for reference only; don't build on them.
 
 ## Pipeline
 
@@ -73,7 +75,12 @@ python tests/test_evaluate.py                          # scorer self-check (incl
 - **Candidate report:** share of true pairs found, reduction ratio, candidates per S1, and `f05_ceiling` (the best score a perfect matcher could reach on these candidates).
 - **Matching report:** F0.5 by country, singleton accuracy, precision/recall, false-positive counts.
 
-**4. Matching:** not implemented yet (tasks T3/T4/T6 in `docs/PIPELINE.md`).
+**4. Everything in one command** (skips finished stages; see the script header for the decisions baked in):
+```bash
+bash scripts/run_pipeline.sh                  # local_val (train + score) and test (predict + validate)
+SHIFT=-0.5 bash scripts/run_pipeline.sh       # stricter decoding for test
+```
+Or stage by stage: `translit.py --split local_train` → `blocking.py` → `features.py` → `match.py --cv | --fit | --predict`, then `error_analysis.py --split local_val` for where the loss is.
 
 **5. Before submitting**
 ```bash

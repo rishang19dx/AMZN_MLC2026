@@ -133,5 +133,78 @@ def create_validation_split(fraction=config.VAL_FRACTION, seed=config.SPLIT_SEED
     return counts
 
 
+def create_ce_train_split(fraction=0.05, seed='mlc26-ce'):
+    """
+    ce_train = a hash-sampled `fraction` of local_train's Source 1 (+ their
+    ground-truth rows) against ALL local_train targets, so blocking produces
+    realistic hard negatives. The target files are symlinks, not copies.
+    Disjoint from local_val and test by construction.
+    """
+    src, dst = config.split_paths('local_train'), config.split_paths('ce_train')
+    os.makedirs(dst['dir'], exist_ok=True)
+    keep = set()
+    with open(src['s1'], encoding='utf-8') as f, open(dst['s1'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        for line in f:
+            eid = line.split('\t', 1)[0]
+            if in_holdout(eid, fraction, seed):
+                keep.add(eid)
+                o.write(line)
+    with open(src['gt'], encoding='utf-8') as f, open(dst['gt'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        o.writelines(line for line in f if line.split('\t', 1)[0] in keep)
+    for key in ('s2', 's3'):
+        if os.path.lexists(dst[key]):
+            os.remove(dst[key])
+        os.symlink(os.path.relpath(src[key], dst['dir']), dst[key])
+    print(f'ce_train: {len(keep):,} Source 1 entities against all local_train targets -> {dst["dir"]}')
+
+
+def create_scale_val_split(fraction=0.20, seed='mlc26-scale'):
+    """
+    scale_val = a hash-sampled `fraction` of local_train's Source 1 (excluding
+    ce_train's) against ALL local_train targets. local_val is a ~9x smaller
+    universe than test, and on test the candidates are far more similar to
+    their Source 1 (address TF-IDF cosine median 0.46 vs 0.32; RapidFuzz
+    address token-set 0.72 vs 0.57): a bigger pool has closer look-alikes.
+    A matcher trained and scored here sees test-sized crowding and IDF.
+    Same layout as ce_train (targets are symlinks).
+    """
+    src, dst = config.split_paths('local_train'), config.split_paths('scale_val')
+    ce = config.split_paths('ce_train')['s1']
+    exclude = set()
+    if os.path.exists(ce):
+        with open(ce, encoding='utf-8') as f:
+            next(f)
+            exclude = {line.split('\t', 1)[0] for line in f}
+    os.makedirs(dst['dir'], exist_ok=True)
+    keep = set()
+    with open(src['s1'], encoding='utf-8') as f, open(dst['s1'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        for line in f:
+            eid = line.split('\t', 1)[0]
+            if eid not in exclude and in_holdout(eid, fraction, seed):
+                keep.add(eid)
+                o.write(line)
+    with open(src['gt'], encoding='utf-8') as f, open(dst['gt'], 'w', encoding='utf-8') as o:
+        o.write(next(f))
+        o.writelines(line for line in f if line.split('\t', 1)[0] in keep)
+    for key in ('s2', 's3'):
+        if os.path.lexists(dst[key]):
+            os.remove(dst[key])
+        os.symlink(os.path.relpath(src[key], dst['dir']), dst[key])
+    print(f'scale_val: {len(keep):,} Source 1 entities against all local_train targets -> {dst["dir"]}')
+
+
 if __name__ == '__main__':
-    create_validation_split()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--ce-train', action='store_true', help='also (only) build the cross-encoder training split')
+    ap.add_argument('--scale-val', action='store_true', help='(only) build the test-scale matcher split')
+    args = ap.parse_args()
+    if args.scale_val:
+        create_scale_val_split()
+    elif args.ce_train:
+        create_ce_train_split()
+    else:
+        create_validation_split()

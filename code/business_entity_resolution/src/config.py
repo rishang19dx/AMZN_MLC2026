@@ -32,7 +32,13 @@ CANDIDATE_PAIRS = os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv')
 VAL_FRACTION = 0.10
 SPLIT_SEED = 'mlc26'
 
-SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val')
+SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val', 'ce_train', 'scale_val')
+# scale_val: ~20% of local_train's Source 1 (not ce_train's) against ALL
+# local_train targets (data_loader.py --scale-val). Test-sized target pool, so
+# the matcher is trained/scored with test-like crowding and IDF.
+# ce_train: ~5% of local_train's Source 1 against ALL local_train targets
+# (data_loader.py --ce-train). Training data for the cross-encoder that is
+# disjoint from local_val and test, so its scores there are out-of-sample.
 
 
 def split_paths(name):

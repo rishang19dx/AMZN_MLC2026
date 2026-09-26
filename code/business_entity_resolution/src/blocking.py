@@ -120,14 +120,35 @@ def _worker(args):
     return _topk_rows(_SHARED['X'], _SHARED['YT'], k, start, chunk)
 
 
-def topk_sparse(X, Y, k, chunk=2048, workers=1):
+BYTES_PER_NNZ = 24   # sparse product: int64 index + float32 data, plus scipy's temporaries
+
+
+def plan_chunk(X, YT, workers, budget_gb, sample=256):
+    """
+    Rows per chunk so that `workers` simultaneous chunk products fit in
+    budget_gb. Product density grows with the number of targets per country
+    (local_val ~12k non-zeros per row, test ~6-11x that), so a fixed chunk
+    that is fine on local_val runs the laptop out of memory on test.
+    """
+    n = X.shape[0]
+    idx = np.random.default_rng(0).choice(n, min(sample, n), replace=False)
+    nnz_row = max(1.0, (X[idx] @ YT).nnz / len(idx))
+    chunk = int(budget_gb * 1e9 / (workers * nnz_row * BYTES_PER_NNZ))
+    return int(np.clip(chunk, 16, 4096)), nnz_row
+
+
+def topk_sparse(X, Y, k, workers=1, budget_gb=None):
     """
     For each row of X return the k columns of X @ Y.T with the highest score
     (rows are L2-normalised TF-IDF, so scores are cosines). Returns three flat
     arrays (row, col, score); rows with fewer than k non-zero scores return fewer.
-    Row chunks run in parallel in forked worker processes (Linux).
+    Row chunks run in parallel in forked worker processes (Linux), sized to a
+    memory budget (BER_BLOCK_MEM_GB, default 3 GB for all workers together).
     """
     YT = Y.T.tocsr()
+    budget_gb = budget_gb or float(os.environ.get('BER_BLOCK_MEM_GB', 3))
+    chunk, nnz_row = plan_chunk(X, YT, workers, budget_gb)
+    log(f'    product ~{nnz_row:,.0f} non-zeros/row -> {chunk} rows/chunk x {workers} workers')
     jobs = [(s, chunk, k) for s in range(0, X.shape[0], chunk)]
     if workers > 1 and len(jobs) > 1:
         import multiprocessing as mp
@@ -178,13 +199,29 @@ def duck(split):
     return con
 
 
+DEFAULT_K = {'name': 0, 'addr': 20, 'full': 30}
+DEFAULT_MAX_DF = 0.02
+
+
+def _readable(path):
+    """A parquet file with a valid footer (i.e. not cut off mid-write)."""
+    import duckdb
+    try:
+        duckdb.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()
+        return True
+    except Exception:
+        return False
+
+
 def generate_candidates(split, s1, tg, ks, max_df, workers=1):
     """Writes one parquet part per (country, pass): columns s1, tg (row indices),
     score_<pass>, rank_<pass>. Returns the part directory."""
     import duckdb
     part_dir = os.path.join(config.CACHE_DIR, split, 'blocking_parts')
-    shutil.rmtree(part_dir, ignore_errors=True)
-    os.makedirs(part_dir)
+    os.makedirs(part_dir, exist_ok=True)
+    # Resumable: a finished (country, pass) part is kept across runs (written to
+    # a temp name, then renamed, so a stopped run never leaves a half part).
+    # Settings are part of the file name, so changed K / max-df recompute.
     for ci, (country, s1_c) in enumerate(s1.groupby('country', sort=False)):
         tg_c = tg[tg['country'] == country]
         if tg_c.empty:
@@ -193,10 +230,17 @@ def generate_candidates(split, s1, tg, ks, max_df, workers=1):
         for pname, (fields, kw) in PASSES.items():
             if ks[pname] <= 0:
                 continue
+            path = os.path.join(part_dir, f'c{ci:02d}_{pname}_k{ks[pname]}_df{max_df:g}.parquet')
+            legacy = os.path.join(part_dir, f'c{ci:02d}_{pname}.parquet')   # older runs, default settings only
+            if os.path.exists(path) or (os.path.exists(legacy) and ks[pname] == DEFAULT_K[pname]
+                                        and max_df == DEFAULT_MAX_DF and _readable(legacy)):
+                log(f'  {country:>8} {pname:>4}: already done, kept')
+                continue
             r, c, v = run_pass(field_text(s1_c, fields), field_text(tg_c, fields), ks[pname], max_df, kw, workers)
             part = pd.DataFrame({'s1': s1_idx[r], 'tg': tg_idx[c],
                                  f'score_{pname}': v, f'rank_{pname}': rank_within(r, v)})
-            duckdb.from_df(part).write_parquet(os.path.join(part_dir, f'c{ci:02d}_{pname}.parquet'))
+            duckdb.from_df(part).write_parquet(path + '.tmp')
+            os.replace(path + '.tmp', path)
             log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
             del part, r, c, v
     return part_dir
@@ -236,6 +280,9 @@ def write_outputs(split, s1, tg, part_dir, ks):
         f.write('source1_entity_id\tcandidate_entity_ids\n')
         while rows := cur.fetchmany(50_000):
             f.writelines(f'{a}\t{b or ""}\n' for a, b in rows)
+    # completion marker, written last: run_pipeline.sh only skips blocking when it exists
+    with open(os.path.join(cache_dir, 'blocking.done'), 'w') as f:
+        f.write(f'{n}\n')
     shutil.rmtree(part_dir, ignore_errors=True)
     shutil.rmtree(os.path.join(cache_dir, 'duckdb_tmp'), ignore_errors=True)
     log(f'wrote {tsv} and {pq}')
@@ -263,13 +310,13 @@ def report_by_pass(split, tg):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--split', default='local_val', choices=config.SPLIT_NAMES)
-    ap.add_argument('--k-name', type=int, default=0, help='0 disables the pass (slow, weak on local_val)')
-    ap.add_argument('--k-addr', type=int, default=20)
-    ap.add_argument('--k-full', type=int, default=30)
-    ap.add_argument('--max-df', type=float, default=0.02,
+    ap.add_argument('--k-name', type=int, default=DEFAULT_K['name'], help='0 disables the pass (slow, weak on local_val)')
+    ap.add_argument('--k-addr', type=int, default=DEFAULT_K['addr'])
+    ap.add_argument('--k-full', type=int, default=DEFAULT_K['full'])
+    ap.add_argument('--max-df', type=float, default=DEFAULT_MAX_DF,
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
-    ap.add_argument('--workers', type=int, default=os.cpu_count())
+    ap.add_argument('--workers', type=int, default=int(os.environ.get('BER_WORKERS', os.cpu_count())))
     args = ap.parse_args()
 
     s1, tg = load_split(args.split)
