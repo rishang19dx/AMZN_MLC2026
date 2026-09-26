@@ -117,7 +117,7 @@ F0.5 = 1.25·TP / (1.25·TP + 0.25·FN + FP)
 
 **Throughput (estimate, unmeasured):** deberta-v3-base in fp16 on a 4090 does about 4–6k pairs/s for inference, so about 2–3 h for all test candidates (about 2× on a 3090). mmBERT-small with FlashAttention 2 is roughly 3× faster.
 
-## 6. Corrections to `research.pdf`
+## 6. Corrections to `research/research.pdf`
 
 - **"Escalate uncertain pairs to an LLM that retrieves external context":** prohibited (external lookup), grounds for disqualification.
 - **"Use libpostal postal codes as blocking keys":** our data has essentially no postcodes.

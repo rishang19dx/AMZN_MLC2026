@@ -22,7 +22,7 @@ This is the living handoff doc. For background and the history of what was built
 | Test-scale split | `data_loader.py --scale-val` | Train/score the matcher with test-like crowding | `scale_val`: 377,423 `local_train` Source 1 (not `ce_train`'s) against **all 9.29M** `local_train` targets | ⏳ blocking running (Sat 17:27) |
 | Package | `scripts/run_pipeline.sh`, `utils/validate_submission.py`, `Documentation_template.md` | Zip; outputs reproducible from data using only the package | end-to-end script done | ✅ full chain + validator **PASS** on a small test sample. ❌ not yet on the full test set; docs and zip TODO |
 
-Legacy code, kept for reference only: `blocking_legacy.py`, `matching.py`, `preprocess.py` (they still import Unidecode, which is no longer in `requirements.txt`).
+Legacy code (`blocking_legacy.py`, `matching.py`, `preprocess.py`) was removed on Sat 26 Sep; it is in git history.
 
 ## 2. Key facts from the data (drive the design)
 

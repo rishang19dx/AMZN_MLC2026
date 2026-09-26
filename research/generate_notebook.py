@@ -21,10 +21,10 @@ notebook = {
     "import matplotlib.pyplot as plt\n",
     "\n",
     "# File paths\n",
-    "s1_path = 'dataset/train/train_source1.tsv'\n",
-    "s2_path = 'dataset/train/train_source2.tsv'\n",
-    "s3_path = 'dataset/train/train_source3.tsv'\n",
-    "gt_path = 'dataset/train/train_ground_truth.tsv'\n"
+    "s1_path = '../dataset/train/train_source1.tsv'\n",
+    "s2_path = '../dataset/train/train_source2.tsv'\n",
+    "s3_path = '../dataset/train/train_source3.tsv'\n",
+    "gt_path = '../dataset/train/train_ground_truth.tsv'\n"
    ]
   },
   {
