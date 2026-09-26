@@ -1,0 +1,57 @@
+# Configuration for Multi-Pipeline Candidate Generation and Blocking System
+
+models:
+  bert:
+    enabled: true
+    model_name: "sentence-transformers/all-MiniLM-L6-v2"  # 22.7M parameters (<200M limit), Apache 2.0 license
+    max_length: 128
+    batch_size: 64
+    epochs: 3
+    learning_rate: 2.0e-5
+    embedding_dim: 384
+    top_k_source2: 30
+    top_k_source3: 30
+
+  learned:
+    enabled: true
+    model_name: "google/electra-small-discriminator"     # 14M parameters (<200M limit), Apache 2.0 license
+    max_length: 128
+    batch_size: 64
+    epochs: 3
+    learning_rate: 2.0e-5
+    embedding_dim: 256
+    top_k_source2: 30
+    top_k_source3: 30
+
+  classical:
+    enabled: true
+    top_k_source2: 30
+    top_k_source3: 30
+    max_bucket_size: 2000
+    min_score_threshold: 0.15
+
+blocking:
+  bert_top_k: 30
+  learned_top_k: 30
+  classical_top_k: 30
+  max_candidates_per_entity: 100
+  use_faiss: true
+  device: "auto"
+
+validation:
+  enabled: true
+  val_ratio: 0.1
+  seed: 42
+
+training:
+  subset_ratio: 1.0
+  seed: 42
+  temperature: 0.05
+  hard_negatives:
+    enabled: false
+    top_k_search: 20
+    max_per_anchor: 5
+
+filtering:
+  enabled: true
+  threshold: 0.45
