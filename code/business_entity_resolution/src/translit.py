@@ -62,26 +62,37 @@ def build(split, min_count, min_share):
         native.update(read_rows(p[key], keep=lambda n, a: has_indic(n) or has_indic(a)))
     print(f'{len(s1):,} Source 1 records, {len(native):,} targets with Indic script ({time.time() - t0:.0f}s)')
 
+    def pairs():
+        with open(p['gt'], encoding='utf-8') as f:
+            next(f)
+            for line in f:
+                s1_id, _, matched = line.rstrip('\n').partition('\t')
+                for t in matched.split(','):
+                    if t in native:
+                        yield s1[s1_id], native[t]
+
+    return learn_table(pairs(), min_count, min_share)
+
+
+def learn_table(pairs, min_count, min_share):
+    """
+    Learn the word table from true pairs ((s1_name, s1_addr), (tg_name, tg_addr)).
+    Only pairs whose target text is in an Indic script contribute. Shared with
+    src/blocker/normalization.py, which learns from an in-memory training split.
+    """
     counts = defaultdict(Counter)
     aligned = {'name': 0, 'addr': 0}
-    with open(p['gt'], encoding='utf-8') as f:
-        next(f)
-        for line in f:
-            s1_id, _, matched = line.rstrip('\n').partition('\t')
-            for t in matched.split(','):
-                if t not in native:
-                    continue
-                for field, (src, tgt) in (('name', (s1[s1_id][0], native[t][0])),
-                                          ('addr', (s1[s1_id][1], native[t][1]))):
-                    if not has_indic(tgt):
-                        continue
-                    lat, nat = norm_latin(src).split(), native_words(tgt)
-                    if len(lat) != len(nat):
-                        continue
-                    aligned[field] += 1
-                    for n, l in zip(nat, lat):
-                        if has_indic(n):
-                            counts[n][l] += 1
+    for (s1_name, s1_addr), (tg_name, tg_addr) in pairs:
+        for field, (src, tgt) in (('name', (s1_name, tg_name)), ('addr', (s1_addr, tg_addr))):
+            if not has_indic(tgt):
+                continue
+            lat, nat = norm_latin(src).split(), native_words(tgt)
+            if len(lat) != len(nat):
+                continue
+            aligned[field] += 1
+            for n, l in zip(nat, lat):
+                if has_indic(n):
+                    counts[n][l] += 1
 
     table = {}
     for n, c in counts.items():

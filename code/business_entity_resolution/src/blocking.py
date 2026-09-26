@@ -56,19 +56,22 @@ def log(msg, t0=[time.time()]):
 # Data
 # ---------------------------------------------------------------------------
 
-def load_records(path):
+def load_records(path, keep_raw=True):
     df = read_tsv(path)
     df['name_n'] = df['business_name'].map(norm)
     df['addr_n'] = df['business_address'].map(norm)
     df['full_n'] = df['name_n'] + ' ' + df['addr_n']
+    if not keep_raw:   # raw text is only needed by the dev-loop report; ~2 GB on test
+        df = df.drop(columns=['business_name', 'business_address'])
     return df
 
 
 def load_split(split):
     p = config.split_paths(split)
-    s1 = load_records(p['s1'])
+    keep_raw = split != 'test'
+    s1 = load_records(p['s1'], keep_raw)
     log(f'S1: {len(s1):,} records')
-    tg = pd.concat([load_records(p['s2']), load_records(p['s3'])], ignore_index=True)
+    tg = pd.concat([load_records(p['s2'], keep_raw), load_records(p['s3'], keep_raw)], ignore_index=True)
     log(f'S2+S3: {len(tg):,} records')
     return s1, tg
 
@@ -113,7 +116,9 @@ def topk_sparse(X, Y, k, chunk=2048, workers=1):
     For each row of X return the k columns of X @ Y.T with the highest score
     (rows are L2-normalised TF-IDF, so scores are cosines). Returns three flat
     arrays (row, col, score); rows with fewer than k non-zero scores return fewer.
-    Row chunks run in parallel in forked worker processes (Linux).
+    Row chunks run in parallel in forked worker processes (Linux and macOS;
+    on macOS set OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES, as scripts/mac_run.sh does).
+    Peak memory per worker grows with chunk x len(Y): see auto_chunk().
     """
     YT = Y.T.tocsr()
     jobs = [(s, chunk, k) for s in range(0, X.shape[0], chunk)]
@@ -128,7 +133,18 @@ def topk_sparse(X, Y, k, chunk=2048, workers=1):
     return tuple(np.concatenate([o[j] for o in out]) for j in range(3))
 
 
-def run_pass(s1_text, tg_text, k, max_df, vec_kwargs, workers=1):
+def auto_chunk(n_targets, budget=None):
+    """
+    S1 rows per sparse-product chunk. The product's size (and so each worker's
+    peak memory) grows with rows x targets, so on test (~10x the targets of
+    local_val) the chunk shrinks to keep every worker's peak about the same as
+    local_val's 2048 rows. BER_BLOCK_BUDGET = rows x targets per chunk.
+    """
+    budget = budget or float(os.environ.get('BER_BLOCK_BUDGET', 1.2e9))
+    return int(np.clip(budget / max(n_targets, 1), 64, 2048))
+
+
+def run_pass(s1_text, tg_text, k, max_df, vec_kwargs, workers=1, chunk=2048):
     vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32, min_df=2, **vec_kwargs)
     vec.fit(pd.concat([s1_text, tg_text]))
     X, Y = vec.transform(s1_text), vec.transform(tg_text)
@@ -137,40 +153,72 @@ def run_pass(s1_text, tg_text, k, max_df, vec_kwargs, workers=1):
     df = np.bincount(Y.indices, minlength=Y.shape[1])
     keep = df <= max_df * Y.shape[0]
     X, Y = X[:, keep], Y[:, keep]
-    return topk_sparse(X.tocsr(), Y.tocsr(), k, workers=workers)
+    return topk_sparse(X.tocsr(), Y.tocsr(), k, chunk=chunk, workers=workers)
 
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def generate_candidates(s1, tg, ks, max_df, workers=1):
+def within_rank(group, score):
+    """1-based rank of `score` (descending) within each `group`, ties broken by
+    position: the same as pandas groupby(group).rank(ascending=False,
+    method='first'), at ~8 bytes per row instead of pandas' ~100."""
+    order = np.lexsort((-score, group))            # stable: equal scores keep their order
+    g = group[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(g)) + 1]
+    sizes = np.diff(np.r_[starts, len(g)])
+    rank = np.empty(len(g), np.float32)
+    rank[order] = np.arange(len(g)) - np.repeat(starts, sizes) + 1
+    return rank
+
+
+def generate_candidates(s1, tg, ks, max_df, workers=1, chunk=0):
     """Returns a DataFrame with one row per (s1, target) pair and, for each
-    pass, the cosine score and within-S1 rank (NaN if the pass missed it)."""
-    parts = []
+    pass, the cosine score and within-S1 rank (NaN if the pass missed it).
+    chunk=0 sizes the sparse-product chunks per country with auto_chunk().
+
+    Passes are merged per country (pairs never cross countries) on an int64
+    pair key with numpy, not a pandas two-key groupby: on test (~40M pass rows
+    for India alone) the groupby needed ~10 GB of temporaries."""
+    n_tg = len(tg)
+    cols = [f'{kind}_{pname}' for pname in PASSES for kind in ('score', 'rank')]
+    wides = []
     for country, s1_c in s1.groupby('country', sort=False):
         tg_c = tg[tg['country'] == country]
         if tg_c.empty:
             continue
         s1_idx, tg_idx = s1_c.index.to_numpy(), tg_c.index.to_numpy()
+        ch = chunk or auto_chunk(len(tg_c))
+        keys, passes = [], []
         for pname, (field, kw) in PASSES.items():
             k = ks[pname]
             if k <= 0:
                 continue
-            r, c, v = run_pass(s1_c[field], tg_c[field], k, max_df, kw, workers)
-            part = pd.DataFrame({'s1': s1_idx[r].astype(np.int64), 'tg': tg_idx[c].astype(np.int64)})
-            part[f'score_{pname}'] = v
-            part[f'rank_{pname}'] = part.groupby('s1')[f'score_{pname}'].rank(
-                ascending=False, method='first').astype(np.float32)
-            parts.append(part)
-            log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
-    # one row per pair; a pass that did not retrieve the pair leaves NaN
-    wide = pd.concat(parts, ignore_index=True).groupby(['s1', 'tg'], sort=False).max().reset_index()
-    for pname in PASSES:  # a disabled pass still gets (all-NaN) columns
-        for col in (f'score_{pname}', f'rank_{pname}'):
-            if col not in wide:
-                wide[col] = np.float32('nan')
-    return wide
+            r, c, v = run_pass(s1_c[field], tg_c[field], k, max_df, kw, workers, ch)
+            keys.append(s1_idx[r].astype(np.int64) * n_tg + tg_idx[c])
+            passes.append((pname, v, within_rank(r, v)))
+            log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(r):,} pairs (chunk {ch})')
+            del r, c
+        if not passes:
+            continue
+        # one row per pair; a pass that did not retrieve the pair leaves NaN
+        # (within a pass every pair is unique: top-k columns of one row)
+        sizes = [len(x) for x in keys]
+        uniq, inv = np.unique(np.concatenate(keys), return_inverse=True)
+        del keys
+        wide = {'s1': (uniq // n_tg).astype(np.int32), 'tg': (uniq % n_tg).astype(np.int32)}
+        del uniq
+        for col in cols:          # a disabled pass keeps its (all-NaN) columns
+            wide[col] = np.full(len(wide['s1']), np.nan, np.float32)
+        off = 0
+        for (pname, v, rank), n in zip(passes, sizes):
+            wide[f'score_{pname}'][inv[off:off + n]] = v
+            wide[f'rank_{pname}'][inv[off:off + n]] = rank
+            off += n
+        del passes, inv
+        wides.append(pd.DataFrame(wide))
+    return pd.concat(wides, ignore_index=True)
 
 
 def write_outputs(split, s1, tg, cand):
@@ -179,20 +227,41 @@ def write_outputs(split, s1, tg, cand):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
-    cand = cand.assign(s1_id=s1['entity_id'].to_numpy()[cand['s1']],
-                       cand_id=tg['entity_id'].to_numpy()[cand['tg']])
-    cols = ['s1_id', 'cand_id'] + [c for c in cand.columns if c.startswith(('score_', 'rank_'))]
+    # IDs are joined to the integer row positions inside DuckDB (which spills
+    # to disk if needed): on test, 70M pairs x 2 ID columns as Python strings
+    # would take ~8 GB.
     import duckdb
+    s1_ids, tg_ids = s1['entity_id'].to_numpy(), tg['entity_id'].to_numpy()
+    con = duckdb.connect()
+    con.execute(f"SET memory_limit = '{os.environ.get('BER_DUCKDB_MEMORY', '3GB')}'")
+    con.execute(f"SET temp_directory = '{os.path.join(cache_dir, 'duckdb_tmp')}'")
+    con.execute('SET preserve_insertion_order = false')
+    con.register('c', cand)
+    con.register('s1x', pd.DataFrame({'s1': np.arange(len(s1), dtype=np.int32), 's1_id': s1_ids}))
+    con.register('tgx', pd.DataFrame({'tg': np.arange(len(tg), dtype=np.int32), 'cand_id': tg_ids}))
+    score_cols = ', '.join(f'c.{x}' for x in cand.columns if x.startswith(('score_', 'rank_')))
     pq = os.path.join(cache_dir, 'candidates.parquet')
-    duckdb.from_df(cand[cols]).write_parquet(pq, compression='zstd')
+    con.execute('COPY (SELECT s1x.s1_id, tgx.cand_id, ' + score_cols +
+                ' FROM c JOIN s1x ON c.s1 = s1x.s1 JOIN tgx ON c.tg = tgx.tg)'
+                f" TO '{pq}' (FORMAT parquet, COMPRESSION zstd)")
+    con.close()
 
-    lists = cand.groupby('s1_id')['cand_id'].agg(lambda x: ','.join(sorted(x)))
-    lists = lists.reindex(s1['entity_id'], fill_value='')  # every S1 gets a row
+    # candidate_pairs.tsv: sort pairs by (S1 row, target ID string) with integer
+    # keys and stream the lists out. (DuckDB's ordered string_agg cannot spill
+    # to disk and runs out of memory at this size.) Every S1 gets a row.
+    tg_rank = np.empty(len(tg_ids), np.int64)
+    tg_rank[np.argsort(tg_ids, kind='stable')] = np.arange(len(tg_ids))   # = Python string order
+    s1c, tgc = cand['s1'].to_numpy(), cand['tg'].to_numpy()
+    order = np.lexsort((tg_rank[tgc], s1c))
+    del tg_rank
+    bounds = np.searchsorted(s1c[order], np.arange(len(s1_ids) + 1))
+    ids = tg_ids[tgc[order]]
+    del order
     tsv = os.path.join(out_dir, 'candidate_pairs.tsv')
     with open(tsv, 'w', encoding='utf-8') as f:
         f.write('source1_entity_id\tcandidate_entity_ids\n')
-        for s1_id, ids in lists.items():
-            f.write(f'{s1_id}\t{ids}\n')
+        for i, s1_id in enumerate(s1_ids):
+            f.write(f"{s1_id}\t{','.join(ids[bounds[i]:bounds[i + 1]])}\n")
     log(f'wrote {tsv} and {pq}')
     return tsv
 
@@ -234,12 +303,14 @@ def main():
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
     ap.add_argument('--workers', type=int, default=os.cpu_count())
+    ap.add_argument('--chunk', type=int, default=0,
+                    help='S1 rows per sparse-product chunk; 0 = auto from the target count (BER_BLOCK_BUDGET)')
     ap.add_argument('--no-write', action='store_true', help='diagnostics only')
     args = ap.parse_args()
 
     s1, tg = load_split(args.split)
     ks = {'name': args.k_name, 'addr': args.k_addr, 'full': args.k_full}
-    cand = generate_candidates(s1, tg, ks, args.max_df, args.workers)
+    cand = generate_candidates(s1, tg, ks, args.max_df, args.workers, args.chunk)
     log(f'{len(cand):,} candidate pairs')
     if args.split != 'test':
         report_by_pass(args.split, s1, tg, cand)

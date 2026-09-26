@@ -5,6 +5,7 @@ scipy==1.15.3
 scikit-learn==1.7.2
 duckdb==1.5.5
 Unidecode==1.4.0
+anyascii==0.3.3          # imported by src/normalize.py
 tqdm==4.70.1
 RapidFuzz==3.14.5
 lightgbm==4.7.0
@@ -16,3 +17,8 @@ transformers==5.17.0
 tokenizers==0.23.2
 safetensors==0.8.0
 sentence-transformers==6.1.0
+
+# Multi-pipeline blocker (src/blocker/, docs/BLOCKING.md)
+faiss-cpu==1.15.1        # ANN index; on a CUDA machine faiss-gpu works unchanged (CPU index API)
+PyYAML==6.0.3            # configs/blocking.yaml
+pytest==9.1.1            # tests/test_blocker.py

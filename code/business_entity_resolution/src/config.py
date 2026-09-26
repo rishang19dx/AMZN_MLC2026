@@ -31,8 +31,15 @@ CANDIDATE_PAIRS = os.path.join(OUTPUT_DIR, 'candidate_pairs.tsv')
 # the hash-based assignment reproducible (see data_loader.py).
 VAL_FRACTION = 0.10
 SPLIT_SEED = 'mlc26'
+# Matcher training split: the next FIT_FRACTION of S1 by the same hash, built
+# like local_val (a closed universe), a subset of local_train, disjoint from
+# local_val. Sized to fit a 16 GB machine (see data_loader.py).
+FIT_FRACTION = float(os.environ.get('BER_FIT_FRACTION', '0.15'))
 
-SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val')
+# CPU threads for LightGBM (and anything else that takes a thread count).
+THREADS = int(os.environ.get('BER_THREADS', os.cpu_count()))
+
+SPLIT_NAMES = ('train', 'test', 'local_train', 'local_val', 'local_fit')
 
 
 def split_paths(name):

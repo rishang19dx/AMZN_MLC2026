@@ -1,0 +1,14 @@
+# Apple Silicon (macOS, CPU) environment for the active pipeline:
+# data_loader -> translit -> blocking -> features -> match (LightGBM).
+# Python 3.12 (python3.10 also works). LightGBM needs OpenMP: `brew install libomp`.
+# torch / transformers are left out: no active src/ file imports them (the
+# cross-encoder is not implemented yet); use requirements.txt for that.
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+duckdb==1.5.5
+anyascii==0.3.3
+tqdm==4.70.1
+RapidFuzz==3.14.5
+lightgbm==4.7.0

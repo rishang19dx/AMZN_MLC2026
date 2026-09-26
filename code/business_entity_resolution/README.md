@@ -36,6 +36,10 @@ Design in one line each (details and evidence in `docs/REPORT.md`):
 - **One S1 per target:** every S2/S3 record matches at most one S1, so each target is assigned only to its best S1.
 - **Threshold:** tuned on `local_val`, then set slightly stricter for test, which has more distractors (5.75 targets per S1 vs 4.68).
 
+## Multi-pipeline blocker (new, not yet run on real data)
+
+`src/blocker/` adds three independent candidate generators whose lists are unioned: (A) a fine-tuned BERT bi-encoder (multilingual-e5-small, MIT), (B) a JEPA-style predictive encoder (multilingual MiniLM, Apache-2.0), and (C) TF-IDF passes plus blocking keys (reusing `blocking.py`). It comes with FAISS retrieval, a prioritised budget, a blocking checker with penalties (`src/check_blocking.py`), and a basic LightGBM matcher (`src/lgbm_matcher.py`). Everything is configured in `configs/blocking.yaml`, and `bash scripts/run_multiblock.sh` runs it end to end. Full description, flags (including `--train-fraction`), metrics and compute estimates: [`docs/BLOCKING.md`](docs/BLOCKING.md).
+
 ## Setup
 
 ```bash
@@ -80,6 +84,21 @@ python tests/test_evaluate.py                          # scorer self-check (incl
 python3 ../../utils/validate_submission.py --matching ../../output/test/matching_results.tsv \
     --candidate ../../output/test/candidate_pairs.tsv --test-dir ../../dataset/test
 ```
+
+## Running on a Mac (Apple Silicon, 16 GB)
+
+One command runs the whole pipeline, from splits to a validated `output/test/matching_results.tsv`:
+```bash
+bash scripts/mac_run.sh          # creates .venv from requirements-mac.txt if missing; rerun to resume
+STAGES="fit eval" bash scripts/mac_run.sh      # a subset; FORCE=1 redoes finished stages
+```
+- **Data:** expects the raw TSVs in `<ML_Channel>/student_resource/dataset/{train,test}`; override with `BER_DATA_DIR`.
+- **Training split:** `local_fit`, 15% of train Source 1 (`BER_FIT_FRACTION`). It is built like `local_val` (a closed universe), is a subset of `local_train`, and is disjoint from `local_val`. All of `local_train` (~75M pairs) does not fit in 16 GB.
+- **Training:** `match.py --fit --folds 5` runs a 5-fold grouped cross-fit (grouped by Source 1) of both LightGBM stages. The 5 fold models of each stage are the final ensemble; their probabilities are averaged at inference.
+- **Holdout:** `match.py --eval --split local_val` scores the saved ensemble on the untouched `local_val` and tunes `decode.json` there.
+- **Saved weights:** `cache/models/stage{1,2}_fold{0-4}.txt`, `features.json` and `decode.json`; each fold is saved as soon as it is trained. The native-script dictionaries are `cache/translit_{local_train,train}.json`. `--predict` needs only these files.
+- **Machine settings:** the script uses all cores (`BER_THREADS`, default `hw.ncpu`), keeps the Mac awake with `caffeinate`, and logs each stage's wall time and peak RAM to `logs/`. Blocking sizes its sparse-product chunks from the target count (`BER_BLOCK_BUDGET`) so the forked workers fit in 16 GB.
+- **CPU only:** the active pipeline (sparse TF-IDF, RapidFuzz, LightGBM) runs on the CPU; the GPU/MPS is unused.
 
 ## Running on Kaggle / Colab
 

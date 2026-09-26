@@ -51,7 +51,7 @@ import pandas as pd
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize as l2_normalize
+import scipy.sparse as sp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -94,18 +94,31 @@ def load_candidate_index(split, s1_ids, tg_ids):
     """Candidate pairs as integer row indices into s1 / tg, sorted by Source 1."""
     import duckdb
     con = duckdb.connect()
-    con.register('s1x', pd.DataFrame({'id': s1_ids, 'i': np.arange(len(s1_ids), dtype=np.int64)}))
-    con.register('tgx', pd.DataFrame({'id': tg_ids, 'j': np.arange(len(tg_ids), dtype=np.int64)}))
+    # bounded (spills to disk): the default is 80% of RAM, on top of everything else
+    con.execute(f"SET memory_limit = '{os.environ.get('BER_DUCKDB_MEMORY', '3GB')}'")
+    con.execute(f"SET temp_directory = '{os.path.join(config.CACHE_DIR, split, 'duckdb_tmp')}'")
+    con.execute('SET preserve_insertion_order = false')
+    con.register('s1x', pd.DataFrame({'id': s1_ids, 'i': np.arange(len(s1_ids), dtype=np.int32)}))
+    con.register('tgx', pd.DataFrame({'id': tg_ids, 'j': np.arange(len(tg_ids), dtype=np.int32)}))
     path = os.path.join(config.CACHE_DIR, split, 'candidates.parquet')
-    d = con.sql(f"""
+    # streamed in chunks and sorted in numpy: a DuckDB ORDER BY + full fetch
+    # of ~70M rows (test) would have to fit under memory_limit
+    res = con.execute(f"""
         SELECT s1x.i, tgx.j, c.score_addr, c.rank_addr, c.score_full, c.rank_full
         FROM read_parquet('{path}') c
-        JOIN s1x ON c.s1_id = s1x.id JOIN tgx ON c.cand_id = tgx.id
-        ORDER BY s1x.i, tgx.j""").fetchnumpy()
-    out = {}
-    for k, a in d.items():
-        a = a.filled(np.nan) if np.ma.isMaskedArray(a) else a
-        out[k] = a.astype(np.int64 if k in ('i', 'j') else np.float32)
+        JOIN s1x ON c.s1_id = s1x.id JOIN tgx ON c.cand_id = tgx.id""")
+    cols = {k: [] for k in ('i', 'j', 'score_addr', 'rank_addr', 'score_full', 'rank_full')}
+    while True:
+        chunk = res.fetch_df_chunk(500)          # 500 vectors x 2048 rows ~ 1M rows
+        if chunk.empty:
+            break
+        for k in cols:                           # float nulls arrive as NaN
+            cols[k].append(chunk[k].to_numpy(np.int32 if k in ('i', 'j') else np.float32))
+    out = {k: np.concatenate(v) if v else np.empty(0, np.int32 if k in ('i', 'j') else np.float32)
+           for k, v in cols.items()}
+    del cols
+    order = np.lexsort((out['j'], out['i']))
+    out = {k: a[order] for k, a in out.items()}
     n_cand = con.sql(f"SELECT count(*) FROM read_parquet('{path}')").fetchone()[0]
     assert len(out['i']) == n_cand, 'some candidate IDs are missing from the split files'
     return out
@@ -137,6 +150,22 @@ def pair_rowdot(X, Y, i, j, chunk=1_000_000):
     return out
 
 
+def _with_data(M, data):
+    """CSR matrix with M's sparsity structure (shared, not copied) and new values."""
+    return sp.csr_matrix((data, M.indices, M.indptr), shape=M.shape, copy=False)
+
+
+def _l2_data(M):
+    """Values of M with every row scaled to unit L2 norm (empty rows stay empty)."""
+    # per-row sum of squares; a trailing 0 keeps every row start a valid index,
+    # and reduceat gives an empty row one stray element, so zero those after
+    sq = np.add.reduceat(np.append(M.data.astype(np.float64) ** 2, 0.0), M.indptr[:-1])
+    sq[np.diff(M.indptr) == 0] = 0
+    norms = np.sqrt(sq)
+    norms[norms == 0] = 1
+    return (M.data / np.repeat(norms, np.diff(M.indptr))).astype(np.float32)
+
+
 class TfidfField:
     """
     Binary IDF vectors of one field for Source 1 and targets. IDF is fitted on
@@ -151,12 +180,13 @@ class TfidfField:
         vec.fit(pd.concat([s1_text, tg_text]))
         self.word = analyzer == 'word'
         Xw, Yw = vec.transform(s1_text).tocsr(), vec.transform(tg_text).tocsr()
-        self.Xn, self.Yn = l2_normalize(Xw), l2_normalize(Yw)
+        # the normalised and binary variants share Xw/Yw's index arrays
+        # (only a new data array each): saves several GB on test
+        self.Xn, self.Yn = _with_data(Xw, _l2_data(Xw)), _with_data(Yw, _l2_data(Yw))
         if self.word:
             self.Xw, self.Yw = Xw, Yw
-            self.Xb, self.Yb = Xw.copy(), Yw.copy()
-            self.Xb.data[:] = 1
-            self.Yb.data[:] = 1
+            self.Xb = _with_data(Xw, np.ones_like(Xw.data))
+            self.Yb = _with_data(Yw, np.ones_like(Yw.data))
             self.xs = np.asarray(Xw.sum(axis=1)).ravel()
             self.ys = np.asarray(Yw.sum(axis=1)).ravel()
 
@@ -212,6 +242,12 @@ def build_features(split, chunk):
     I, J = c['i'], c['j']
     log(f'candidates: {len(I):,}')
 
+    # the only uses of the raw text; drop it before the big TF-IDF matrices exist
+    tg_addr_missing = (tg['business_address'].to_numpy() == '').astype(np.float32)
+    tg_nonlatin = tg['business_name'].map(is_non_latin).to_numpy().astype(np.float32)
+    for df in (s1, tg):
+        df.drop(columns=['business_name', 'business_address'], inplace=True)
+
     fields = {
         'namew': TfidfField(s1['name_n'], tg['name_n'], 'word'),
         'namec': TfidfField(s1['name_n'], tg['name_n'], 'char'),
@@ -225,8 +261,6 @@ def build_features(split, chunk):
     s1_house = [_house(s) for s in s1a]
     ntok = lambda arr: np.fromiter((len(s.split()) for s in arr), np.float32, len(arr))
     s1_name_ntok, tg_name_ntok, s1_addr_ntok, tg_addr_ntok = ntok(s1n), ntok(tgn), ntok(s1a), ntok(tga)
-    tg_addr_missing = (tg['business_address'].to_numpy() == '').astype(np.float32)
-    tg_nonlatin = tg['business_name'].map(is_non_latin).to_numpy().astype(np.float32)
     tg_is_s3 = np.char.startswith(tg_ids.astype(str), 'S3-').astype(np.float32)
 
     # global counts (need all pairs, not just a part)
