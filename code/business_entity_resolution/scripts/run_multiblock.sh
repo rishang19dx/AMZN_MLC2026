@@ -39,10 +39,11 @@ if wanted splits && [ ! -f "$DATA/splits/local_val/local_val_source1.tsv" ]; the
     run "$PY" src/data_loader.py
 fi
 
-# 2. fine-tune the learned encoders on local_train (validation entities never seen)
-if wanted train && [ -n "$LEARNED" ]; then
+# 2. fine-tune the learned encoders on local_train (validation entities never seen). With no learned
+#    pipeline this only builds the native-script dictionary ($ART/translit.json) that every run uses.
+if wanted train; then
     run "$PY" src/train_blocker.py --train-dir "$DATA/splits/local_train" --val-dir "$DATA/splits/local_val" \
-        --output-dir "$ART" --pipelines "$LEARNED" --train-fraction "$TRAIN_FRACTION" --no-eval \
+        --output-dir "$ART" --pipelines "${LEARNED:-none}" --train-fraction "$TRAIN_FRACTION" --no-eval \
         --config "$CONFIG" ${EXTRA[@]+"${EXTRA[@]}"}
 fi
 

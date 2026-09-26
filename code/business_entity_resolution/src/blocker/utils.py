@@ -82,3 +82,28 @@ def _json_default(o):
 def read_json(path):
     with open(path, encoding='utf-8') as f:
         return json.load(f)
+
+
+# Multi-GPU (e.g. Kaggle "GPU T4 x2"): set once by the CLIs from runtime.multi_gpu.
+MULTI_GPU = {'enabled': True}
+
+
+def n_gpus():
+    try:
+        import torch
+        return torch.cuda.device_count() if MULTI_GPU['enabled'] and torch.cuda.is_available() else 0
+    except ImportError:
+        return 0
+
+
+def data_parallel(module):
+    """torch.nn.DataParallel over every visible GPU when there are >= 2, else the module itself."""
+    if n_gpus() > 1:
+        import torch
+        return torch.nn.DataParallel(module)
+    return module
+
+
+def apply_runtime(cfg):
+    """Process-wide runtime switches from the config."""
+    MULTI_GPU['enabled'] = bool(cfg.get('runtime', {}).get('multi_gpu', True))

@@ -72,6 +72,27 @@ python3 ../../utils/validate_submission.py --matching $OUT/test/matching_results
 
 `train_blocker.py --train-dir $DATA/train` (without `--val-dir`) makes the holdout itself. It uses the same hash as `data_loader.py`, so the holdout equals `local_val`. It then also runs the validation blocker and writes it to `$ART/validation/`.
 
+### On Kaggle
+
+Use `notebooks/kaggle_multiblock.ipynb`. It clones this branch and prepares the VM (see below), then runs `run_multiblock.sh` with:
+- `DATA=/tmp/data`;
+- `OUT=/tmp/out` for the large intermediates;
+- `ART=/kaggle/working/artifacts`, which *Save Version* keeps.
+
+Deliverables are copied to `/kaggle/working/output/`.
+
+**How it prepares the VM** (`scripts/cloud_setup.sh`):
+- It links the attached data in. That can be the official zip as a Dataset, or `mlc26_data.tar.zst`.
+- It installs the pinned requirements but keeps Kaggle's CUDA torch.
+- It builds `local_train` / `local_val`.
+
+**Settings:**
+- `MODE='classical'` runs on CPU.
+- `MODE='full'` needs *GPU T4 x2*. Both GPUs are used through `DataParallel` (`runtime.multi_gpu`), and fp16 AMP is used because T4s have no fast bf16.
+- `STAGES` splits the work across sessions, and `PREV_ARTIFACTS` reuses the encoders from an earlier run.
+
+The notebook's first cell has the full plan.
+
 ### Subset flags (fast training)
 
 | Flag | Effect |

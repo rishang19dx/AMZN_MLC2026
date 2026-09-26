@@ -20,6 +20,8 @@ predicting the representation of missing content).
 """
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from blocker.training.contrastive_training import Trainer
 from blocker.training.losses import cosine_regression, info_nce, variance_hinge
@@ -46,14 +48,22 @@ class JEPATrainer(Trainer):
         super().__init__(*a, **kw)
         self.rng = np.random.default_rng(self.seed + 17)
 
+    def reference(self, texts):
+        with torch.no_grad():
+            return self.par('target', self.model.target)(**self.tok(texts))
+
+    def predict(self, texts):
+        h = self.par('context', self.model.context)(**self.tok(texts))
+        return F.normalize(self.model.predictor(h).float(), dim=-1)
+
     def loss(self, b, hn):
-        m, c = self.model, self.mcfg
+        c = self.mcfg
         T = float(c.get('temperature', 0.07))
         tp, fp = float(c.get('token_mask_prob', 0.15)), float(c.get('field_drop_prob', 0.1))
         s1_txt = self.q_texts[b[:, 0]]
-        z = m.reference(**self.tok(s1_txt))
+        z = self.reference(s1_txt)
         keys = self.keys(b, hn)
-        p = m.predict(**self.tok(mask_texts(self.t_texts[keys], self.rng, tp, 0.0)))
+        p = self.predict(mask_texts(self.t_texts[keys], self.rng, tp, 0.0))
         q_owner, k_owner = self.owners(b[:, 0], keys)
         B = len(b)
         loss = float(c.get('contrastive_weight', 1.0)) * info_nce(z, p, q_owner, k_owner, T)
@@ -61,7 +71,7 @@ class JEPATrainer(Trainer):
         loss = loss + float(c.get('variance_weight', 0.5)) * variance_hinge(p[:B])
         ws = float(c.get('self_weight', 0.5))
         if ws > 0:
-            ps = m.predict(**self.tok(mask_texts(s1_txt, self.rng, tp, fp)))
+            ps = self.predict(mask_texts(s1_txt, self.rng, tp, fp))
             loss = loss + ws * (cosine_regression(ps, z) + info_nce(z, ps, q_owner, q_owner, T, symmetric=False))
         return loss
 

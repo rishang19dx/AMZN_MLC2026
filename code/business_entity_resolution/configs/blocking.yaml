@@ -23,6 +23,7 @@ runtime:
   device: auto              # auto | cuda | mps | cpu
   workers: 0                # CPU processes for sparse retrieval; 0 = all cores
   fp16_inference: true      # half precision for encoding on cuda / mps
+  multi_gpu: true           # DataParallel over all GPUs (Kaggle T4 x2) for training and encoding
   cache_dir: null           # embedding memmaps; null = <output-dir>/cache
 
 models:

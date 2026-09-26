@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blocker  # noqa: E402,F401  (sets macOS/OpenMP environment first)
 from blocker.config import add_config_args, load_config, save_config
 from blocker.run import block_and_report, load_prepared, use_translit
-from blocker.utils import log, set_seed
+from blocker.utils import apply_runtime, log, set_seed
 
 
 def main(argv=None):
@@ -49,6 +49,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.set)
+    apply_runtime(cfg)
     set_seed(int(cfg.get('seed', 42)))
     os.makedirs(args.output_dir, exist_ok=True)
     save_config(cfg, os.path.join(args.output_dir, 'blocking_config.resolved.yaml'))

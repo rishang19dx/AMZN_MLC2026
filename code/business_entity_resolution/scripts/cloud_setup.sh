@@ -3,6 +3,9 @@
 #   bash code/business_entity_resolution/scripts/cloud_setup.sh <archive>
 #   Colab:  <archive> = /content/drive/MyDrive/mlc26/mlc26_data.tar.zst
 #   Kaggle: <archive> = /kaggle/input/mlc26-data/mlc26_data.tar.zst
+#   or a directory that contains train/train_source1.tsv and test/ somewhere below it, e.g. the
+#   official student_resource zip uploaded as a Kaggle Dataset (Kaggle extracts it):
+#           <archive> = /kaggle/input/<dataset-slug>
 #
 # 1. copies the archive from Drive to local disk and verifies its checksum
 # 2. extracts into $BER_DATA_DIR (default <repo>/dataset) and verifies every file
@@ -11,14 +14,23 @@
 # 5. runs the scorer tests
 set -euo pipefail
 
-ARCHIVE="${1:?usage: cloud_setup.sh <path/to/mlc26_data.tar.zst>}"
+ARCHIVE="${1:?usage: cloud_setup.sh <path/to/mlc26_data.tar.zst | raw data directory>}"
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$PROJ/../.." && pwd)"
 DATA="${BER_DATA_DIR:-$REPO/dataset}"
 TMP="${TMPDIR:-/tmp}/$(basename "$ARCHIVE")"
 
 mkdir -p "$DATA"
-if [ -f "$DATA/MANIFEST.sha256" ] && ( cd "$DATA" && sha256sum --quiet -c MANIFEST.sha256 ) 2>/dev/null; then
+if [ -d "$ARCHIVE" ]; then
+    # raw TSVs (read-only input): link train/ and test/ into $DATA; splits are written next to them
+    SRC_TRAIN="$(dirname "$(find -L "$ARCHIVE" -name train_source1.tsv -path '*train/*' | head -1)")"
+    SRC_TEST="$(dirname "$(find -L "$ARCHIVE" -name test_source1.tsv -path '*test/*' | head -1)")"
+    [ -f "$SRC_TRAIN/train_ground_truth.tsv" ] && [ -f "$SRC_TEST/test_source3.tsv" ] \
+        || { echo "no train/ and test/ challenge files under $ARCHIVE"; exit 1; }
+    ln -sfn "$SRC_TRAIN" "$DATA/train"
+    ln -sfn "$SRC_TEST" "$DATA/test"
+    echo "[1-2] using raw data: $DATA/train -> $SRC_TRAIN, $DATA/test -> $SRC_TEST"
+elif [ -f "$DATA/MANIFEST.sha256" ] && ( cd "$DATA" && sha256sum --quiet -c MANIFEST.sha256 ) 2>/dev/null; then
     echo "[1-2] data already present and verified in $DATA"
 else
     echo "[1] copying archive to local disk ..."

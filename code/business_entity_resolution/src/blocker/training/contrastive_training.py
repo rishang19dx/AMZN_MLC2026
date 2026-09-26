@@ -25,7 +25,7 @@ from blocker.training.hard_negative_mining import mine_hard_negatives
 from blocker.training.losses import info_nce
 from blocker.training.pairs import PairBatcher, positive_pairs
 from blocker.models.encoder import tokenize
-from blocker.utils import log, set_seed, write_json
+from blocker.utils import data_parallel, log, n_gpus, set_seed, write_json
 
 
 def evaluation_universe(val_data, max_entities, seed):
@@ -68,7 +68,10 @@ class Trainer:
         self.t_texts = model.texts(train_data.tg, 'target')
         self.owner = train_data.owner()
         self.amp = device.type == 'cuda' and mcfg.get('amp', True)
-        self.amp_dtype = torch.bfloat16 if self.amp and torch.cuda.is_bf16_supported() else torch.float16
+        # bf16 only on Ampere+ (T4 / P100 report "supported" via slow emulation): fp16 + loss scaling there
+        self.amp_dtype = (torch.bfloat16 if self.amp and torch.cuda.get_device_capability(device)[0] >= 8
+                          else torch.float16)
+        self._dp = {}
         self.scaler = torch.amp.GradScaler('cuda') if self.amp and self.amp_dtype == torch.float16 else None
 
     # hooks ------------------------------------------------------------------
@@ -79,6 +82,14 @@ class Trainer:
         pass
 
     # helpers ----------------------------------------------------------------
+    def par(self, name, module):
+        """`module` split over all GPUs (DataParallel) when there are several; cached."""
+        if name not in self._dp:
+            self._dp[name] = data_parallel(module)
+            if self._dp[name] is not module:
+                log(f'  {name}: DataParallel over {n_gpus()} GPUs')
+        return self._dp[name]
+
     def tok(self, texts):
         return tokenize(self.model.tokenizer, texts, self.model.max_length, self.device)
 
@@ -167,9 +178,10 @@ class Trainer:
 class BertTrainer(Trainer):
     def loss(self, b, hn):
         m = self.model
-        q = m.encoder(**self.tok(self.q_texts[b[:, 0]]))
+        enc = self.par('encoder', m.encoder)
+        q = enc(**self.tok(self.q_texts[b[:, 0]]))
         keys = self.keys(b, hn)
-        k = m.encoder(**self.tok(self.t_texts[keys]))
+        k = enc(**self.tok(self.t_texts[keys]))
         q_owner, k_owner = self.owners(b[:, 0], keys)
         return info_nce(q, k, q_owner, k_owner, float(self.mcfg.get('temperature', 0.05)))
 

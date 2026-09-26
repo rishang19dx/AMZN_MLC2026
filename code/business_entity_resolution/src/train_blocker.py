@@ -34,7 +34,7 @@ from blocker.config import add_config_args, load_config, save_config
 from blocker.data import load_dir, split_holdout, subsample
 from blocker.normalization import learn_translit_dict, prepare_data, set_translit_dict
 from blocker.run import KNOWN_MODELS, block_and_report, use_translit
-from blocker.utils import log, n_workers, read_json, resolve_device, set_seed, write_json
+from blocker.utils import apply_runtime, log, n_workers, read_json, resolve_device, set_seed, write_json
 
 
 def model_card(cfg, out_dir):
@@ -56,7 +56,8 @@ def main(argv=None):
     ap.add_argument('--train-dir', required=True, help='labelled directory (*_source{1,2,3}.tsv + *_ground_truth.tsv)')
     ap.add_argument('--val-dir', default=None, help='separate labelled validation directory (else a holdout of --train-dir)')
     ap.add_argument('--output-dir', required=True, help='artifacts directory')
-    ap.add_argument('--pipelines', default='bert,jepa', help='which learned pipelines to train')
+    ap.add_argument('--pipelines', default='bert,jepa',
+                    help="which learned pipelines to train; 'none' = only build translit.json (classical-only runs)")
     ap.add_argument('--train-fraction', type=float, default=None,
                     help='random entity-level fraction of the training part to train on (overrides data.train_fraction)')
     ap.add_argument('--val-fraction', type=float, default=None, help='holdout fraction (overrides data.val_fraction)')
@@ -70,6 +71,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.set)
+    apply_runtime(cfg)
     d = cfg['data']
     if args.train_fraction is not None:
         d['train_fraction'] = args.train_fraction
@@ -79,7 +81,7 @@ def main(argv=None):
         d['val_subsample'] = args.val_subsample
     if args.device:
         cfg['runtime']['device'] = args.device
-    pipes = [p.strip() for p in args.pipelines.split(',') if p.strip()]
+    pipes = [p.strip() for p in args.pipelines.split(',') if p.strip() and p.strip() != 'none']
     for p in pipes:
         if p not in ('bert', 'jepa'):
             ap.error(f'--pipelines: {p!r} is not a learned pipeline (bert, jepa)')
@@ -110,9 +112,11 @@ def main(argv=None):
                                     float(cfg['normalization']['translit_min_share']))
         write_json({'built_from': train.name, 'words': words}, os.path.join(args.output_dir, 'translit.json'))
         set_translit_dict(words)
-    prepare_data(val, cfg, workers)
+    run_eval = cfg['validation'].get('enabled', True) and not args.no_eval
+    if pipes or run_eval:
+        prepare_data(val, cfg, workers)
 
-    if not args.eval_only:
+    if not args.eval_only and pipes:
         fit = subsample(train, float(d['train_fraction']), int(d['subset_seed']))
         log(f'training on {fit.summary()} (train_fraction={d["train_fraction"]})')
         prepare_data(fit, cfg, workers)
@@ -134,7 +138,7 @@ def main(argv=None):
         log(f'model card: {card}')
 
     # -- validation of the whole blocker ----------------------------------------
-    if cfg['validation'].get('enabled', True) and not args.no_eval:
+    if run_eval:
         v = subsample(val, float(d.get('val_subsample', 1.0)), seed, name=f'{val.name}-eval')
         block_and_report(v, cfg, os.path.join(args.output_dir, 'validation'), args.output_dir,
                          pipelines=None, evaluate=True, sweep=True)
