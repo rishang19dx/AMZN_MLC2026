@@ -5,38 +5,7 @@ For each Source 1 (S1) business, find every matching S2/S3 record. Scored by F0.
 
 **Teammates:** read [`docs/REPORT.md`](docs/REPORT.md) (background, history, experiments, what is verified), then pick a task from [`docs/PIPELINE.md`](docs/PIPELINE.md) (status, stage contracts, task board, submission log).
 
-## Current status (Fri 25 Sep, 23:00 IST)
-
-| # | Stage | Command | State | Result / check |
-|---|---|---|---|---|
-| 1 | Local validation split | `src/data_loader.py` | ✅ done | self-contained `local_train` / `local_val`; exact partition checked |
-| 2 | Local scorer | `src/evaluate.py` | ✅ done | reproduces the leaderboard F0.5; unit tests pass |
-| 3 | Cloud runner (Kaggle / Colab) | `scripts/`, `notebooks/cloud_runner.ipynb` | ✅ done | rehearsed locally; ❌ not yet run on a real Kaggle machine |
-| 4 | Blocking v1 | `src/blocking.py` | ✅ done | `local_val`: **98.2% of true pairs found, F0.5 ceiling 0.994**, 38 candidates per S1; ❌ test runtime not yet measured |
-| 5 | Native-script dictionary + anyascii | `src/translit.py`, `src/normalize.py` | ✅ done | blocking recall 98.2% → **98.8%**; native-script names 88.5% → 97.8% |
-| 6 | Matcher (features + two-stage LightGBM + one S1 per target + expected-F0.5 decoding) | `src/features.py`, `src/match.py` | ✅ done | `local_val` out-of-fold **F0.5 0.9858** (India 0.9835, US 0.9874) |
-| 7 | Full test run → Submission 1 | `scripts/run_pipeline.sh` | ⏳ running (Sat 26 Sep, 02:08) | – |
-| 8 | Cross-encoder (mDeBERTa-v3, stage-2 feature) | `src/cross_encoder.py`, `notebooks/kaggle_cross_encoder.ipynb` | code done; ⏳ T4 training | – |
-| 9 | Submission package (validator, docs, zip) | – | ⏳ TODO | – |
-
-`matching.py`, `preprocess.py` and `blocking_legacy.py` are **legacy**, kept for reference only; don't build on them.
-
-## Pipeline
-
-```
-raw TSVs ──> data_loader ──> blocking ──> features ──> LightGBM ──> cross-encoder on ──> assign each ──> threshold ──> matching_results.tsv
-             (splits)        (TF-IDF       (RapidFuzz,    (all pairs)   uncertain pairs      target to its
-                              top-K per     ranks within                 → stacked           best S1
-                              country)      each S1)                     LightGBM
-                               │
-                               └──> candidate_pairs.tsv + cache/<split>/candidates.parquet
-```
-
-Design in one line each (details and evidence in `docs/REPORT.md`):
-- **Countries:** block within country and compare country as a plain string. True matches never cross countries, and this handles France, which appears only in test, without special code.
-- **Normalisation:** no hand-written suffix or state lists; IDF (rarity weighting) learned from the data down-weights "pvt", "llc", "sarl", …
-- **One S1 per target:** every S2/S3 record matches at most one S1, so each target is assigned only to its best S1.
-- **Threshold:** tuned on `local_val`, then set slightly stricter for test, which has more distractors (5.75 targets per S1 vs 4.68).
+For the architecture, data splits, models and leaderboard results, see the [main README](../../README.md). Live status and the submission log: [`docs/PIPELINE.md`](docs/PIPELINE.md).
 
 ## Setup
 
@@ -46,11 +15,11 @@ pip install -r requirements.txt        # pinned; for CPU-only torch, first:
                                        # pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 Put the raw data in `../../dataset/{train,test}/`, or extract `mlc26_data.tar.zst` there.
-All challenge TSVs must be read with quoting disabled (`data_loader.read_tsv`), because some fields contain literal `"` characters.
+Read challenge TSVs with `data_loader.read_tsv` (tab-separated, quoting disabled, every value a string). Values containing `"` are CSV-escaped (`"""ehpad Club SAS"`); reading them raw keeps a few stray quotes, which normalisation strips.
 
 ## Running (all commands from this directory)
 
-Every stage takes `--split {local_val|local_train|train|test}`. Develop on `local_val`; run `local_train` and `test` on Kaggle.
+Every stage takes `--split {local_val|local_train|scale_val|ce_train|train|test}` (what each split is for: main README, *Data splits*).
 
 **1. Local splits** (~1 min) → `../../dataset/splits/{local_train,local_val}/`
 ```bash
@@ -59,6 +28,12 @@ python src/data_loader.py
 - `local_val` = 10% of S1 (by seeded hash) + every S2/S3 record matched to them + 10% of the records that match nothing.
 - `local_train` = everything else.
 - Each is self-contained, like the test set. Scoring held-out S1 against *all* train S2/S3 would be misleading: 90% of the targets would belong to S1 records outside the split.
+
+Test-scale helper splits (both use all `local_train` targets through symlinks):
+```bash
+python src/data_loader.py --scale-val    # scale_val: 20% of local_train Source 1 -> matcher training at test scale
+python src/data_loader.py --ce-train     # ce_train: 5% of local_train Source 1 -> cross-encoder training
+```
 
 **2. Blocking** → `../../output/<split>/candidate_pairs.tsv` + `../../cache/<split>/candidates.parquet`
 ```bash
@@ -81,6 +56,15 @@ bash scripts/run_pipeline.sh                  # local_val (train + score) and te
 SHIFT=-0.5 bash scripts/run_pipeline.sh       # stricter decoding for test
 ```
 Or stage by stage: `translit.py --split local_train` → `blocking.py` → `features.py` → `match.py --cv | --fit | --predict`, then `error_analysis.py --split local_val` for where the loss is.
+
+**Memory (15 GB laptop, test scale: 11.7M records, 65M pairs).** Measured: test features 26 min / 9.9 GB peak; test predict 36 min / 11.6 GB; test blocking 4.4 h.
+```bash
+python src/features.py --split test --index-only            # candidate index in its own process (37 s, 6.8 GB), cached
+BER_FEATURE_CHUNK=300000 python src/features.py --split test  # smaller parts = lower peak; memory is printed on every log line
+python src/match.py --split test --predict                    # also saves cache/test/pred.npz
+python src/match.py --split test --redecode --shift=-0.5      # decoding variant in ~6 min -> matching_results_shift-0.50.tsv
+```
+Launch long jobs detached (`setsid nohup ... &`) so they survive a closed terminal; `scripts/mem_guard.sh` stops the pipeline cleanly before the machine runs out of memory.
 
 **5. Before submitting**
 ```bash

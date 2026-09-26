@@ -54,7 +54,7 @@ Existing code: `blocking.py` (exact name / prefix / sorted-token keys in Python 
 - An NLI "entailment" score is not a "same business" score.
 - `requirements.txt` was not pinned, and `unidecode` was missing from the venv, so `preprocess.py` could not even be imported.
 
-These files are kept as `blocking_legacy.py`, `matching.py` and `preprocess.py` **for reference only**.
+These files were kept for reference as `blocking_legacy.py`, `matching.py` and `preprocess.py` and **removed on Sat 26 Sep** (nothing imported them, and they imported Unidecode, which is no longer a dependency); they remain in git history.
 
 ### Step 1: Validation split + scorer: PR #1 (merged)
 - **`data_loader.py`** splits the training data into two self-contained universes:
@@ -139,6 +139,26 @@ These files are kept as `blocking_legacy.py`, `matching.py` and `preprocess.py` 
 | entities with every match found | 0.9486 | 0.9019 | 0.9800 |
 | **F0.5 ceiling (perfect matcher)** | **0.9937** | 0.9870 | 0.9982 |
 | reduction ratio | 0.99993 | 0.99991 | 0.99994 |
+
+**Run D (Sat 26 Sep, after the test run; rejected): shortlist by rare words, rank with all words.** Test blocking took 4.4 h, and India `full` alone took 107 min. The cost is the sparse product: each S1 row touches every target that shares *any* kept word, which is about 159k targets per row for India `full` on test. Run B showed that dropping common words loses recall because they *rank* the candidates. So we tried keeping them for ranking only:
+1. Shortlist the top-M targets using only rare words (document frequency ≤ `rare_df` × targets).
+2. Rescore the shortlist with the exact Run C cosine (every word kept by max-df 2%).
+3. Keep the top K.
+
+Optionally, S1 rows with fewer than K shortlisted targets fall back to the full product. The script is [`experiments/rare_shortlist.py`](../experiments/rare_shortlist.py). All numbers are on `local_val` with 16 workers and addr K=20 + full K=30:
+
+| rare_df / M / fallback | time (passes only) | union recall | US | India | F0.5 ceiling | full-pass top-30 same as Run C |
+|---|---|---|---|---|---|---|
+| **Run C (current)** | 166 s | **0.9880** | 0.9941 | 0.9788 | **0.9961** | 100% |
+| 0.1% / 100 / on | 53 s | 0.9506 | 0.9590 | 0.9380 | 0.9800 | 69% |
+| 0.1% / 100 / off | 39 s | 0.9354 | 0.9517 | 0.9112 | 0.9689 | 67% |
+| 0.05% / 100 / on | 64 s | 0.9453 | 0.9518 | 0.9356 | 0.9776 | 67% |
+| 0.2% / 100 / on | 52 s | 0.9619 | 0.9755 | 0.9417 | 0.9850 | 76% |
+| 0.1% / 200 / on | 83 s | 0.9569 | 0.9675 | 0.9410 | 0.9831 | 73% |
+
+- **Speed.** The rare-word product touches only 1–10% of Run C's non-zeros per row. Wall time still falls only 2–4×, because the single-threaded rescoring and the fallback rows (3–22%, more in India) take over.
+- **Recall is the problem.** Many true pairs share *no* rare word with their S1 record: their evidence is mid-frequency words (0.1–2% of targets, such as streets, localities and name parts). Even the best variant loses 2.6 points of recall and 0.011 of F0.5 ceiling. That is more than any matcher improvement we expect.
+- **Decision: rejected.** Keep Run C's candidate set. Get speed only from methods that return the *same* top-K (compiled sparse top-k, exact dynamic pruning), never from pruning the vocabulary. Run B and Run D both show the vocabulary cannot be cut.
 
 ## 4. What is verified and what is not
 
