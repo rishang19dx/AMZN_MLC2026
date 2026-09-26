@@ -66,7 +66,7 @@ MODEL_DIR = os.path.join(config.CACHE_DIR, 'models')
 
 LGB_PARAMS = dict(objective='binary', learning_rate=0.08, num_leaves=127, min_data_in_leaf=200,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=os.cpu_count(), verbose=-1, seed=26)
+                  num_threads=config.N_THREADS, verbose=-1, seed=26)
 
 
 def log(msg, t0=[time.time()]):
@@ -211,7 +211,7 @@ def predict(model, X, rows=None, chunk=1_000_000):
     rows = np.arange(len(X)) if rows is None else rows
     out = np.empty(len(rows), np.float32)
     for s in range(0, len(rows), chunk):
-        out[s:s + chunk] = model.predict(X[rows[s:s + chunk]], num_threads=os.cpu_count())
+        out[s:s + chunk] = model.predict(X[rows[s:s + chunk]], num_threads=config.N_THREADS)
     return out
 
 
@@ -406,21 +406,48 @@ def run_cv(split):
     np.save(os.path.join(config.CACHE_DIR, split, 'oof_p2.npy'), p2)   # for error analysis
 
 
-def run_fit(split):
+def load_oof_p1(split, n):
+    """Out-of-fold stage-1 probabilities saved by an earlier --cv / --fit on the
+    same feature parts (same folds and seeds, so identical to recomputing), or
+    None if missing, the wrong length, or older than the feature parts."""
+    path = os.path.join(config.CACHE_DIR, split, 'oof_p1.npy')
+    if not os.path.exists(path):
+        return None
+    parts = feature_parts(split)
+    if parts and os.path.getmtime(path) < max(os.path.getmtime(x) for x in parts):
+        return None
+    p1 = np.load(path)
+    return p1 if len(p1) == n else None
+
+
+def run_fit(split, stage2_only=False):
     pairs = Pairs(split)
     all_rows = np.arange(len(pairs))
     folds, es_fold = pairs.row_fold(split, 2, 'mlc26-cv'), pairs.row_fold(split, 10, 'mlc26-es')
-    # stage 2 must be trained on *out-of-fold* stage-1 probabilities, as at test time
-    p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
-    np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
-    full = lgb.Dataset(pairs.X, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
-    m1 = fit_on(full, all_rows, es_fold)
-    del full
+    # stage 2 must be trained on *out-of-fold* stage-1 probabilities, as at test time.
+    # --cv already computed them with the same folds and seeds: reuse when valid
+    # (saves a full stage-1 cross-fit, ~45 min on scale_val).
+    p1 = load_oof_p1(split, len(pairs))
+    if p1 is None:
+        p1, _ = cross_fit(pairs, pairs.X, folds, es_fold)
+        np.save(os.path.join(config.CACHE_DIR, split, 'oof_p1.npy'), p1)   # band rule for cross_encoder.py
+    else:
+        log('stage 1 out-of-fold probabilities: reused from --cv (oof_p1.npy)')
+    if stage2_only:
+        # stage 1 does not change when a stage-2 member (e.g. the cross-encoder)
+        # is added: keep the saved final stage-1 model instead of retraining it
+        m1 = lgb.Booster(model_file=os.path.join(MODEL_DIR, 'stage1.txt'))
+        log('stage 1: kept the saved model (--stage2-only)')
+    else:
+        full = lgb.Dataset(pairs.X, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
+        m1 = fit_on(full, all_rows, es_fold)
+        del full
     X2, extra = stage2_matrix(split, (pairs.s1_code, pairs.t_code), pairs.X, p1)
     full = lgb.Dataset(X2, pairs.label, params=LGB_PARAMS, free_raw_data=False).construct()
     m2 = fit_on(full, all_rows, es_fold)
     os.makedirs(MODEL_DIR, exist_ok=True)
-    m1.save_model(os.path.join(MODEL_DIR, 'stage1.txt'))
+    if not stage2_only:
+        m1.save_model(os.path.join(MODEL_DIR, 'stage1.txt'))
     m2.save_model(os.path.join(MODEL_DIR, 'stage2.txt'))
     decode_path = os.path.join(MODEL_DIR, 'decode.json')
     if not os.path.exists(decode_path):   # no --cv run: use the setting --cv chose on local_val
@@ -428,7 +455,7 @@ def run_fit(split):
             json.dump({'method': 'expected_f', 'param': 0.0, 'cv_f05': None, 'split': 'default'}, f, indent=2)
     with open(os.path.join(MODEL_DIR, 'features.json'), 'w') as f:
         json.dump({'stage1': pairs.feats, 'stage2': pairs.feats + extra, 'trained_on': split}, f, indent=2)
-    log(f'saved models to {MODEL_DIR} ({m1.best_iteration} / {m2.best_iteration} trees)')
+    log(f'saved models to {MODEL_DIR} ({m1.current_iteration() if stage2_only else m1.best_iteration} / {m2.best_iteration} trees)')
 
 
 def run_predict(split, shift=None):
@@ -442,16 +469,30 @@ def run_predict(split, shift=None):
     m2 = lgb.Booster(model_file=os.path.join(MODEL_DIR, 'stage2.txt'))
     parts = feature_parts(split)
 
-    s1c, tc, src, p1 = [], [], [], []
-    for path in parts:
-        meta, X, _ = read_part(path, fl['stage1'])
-        s1c.append(meta['s1_idx'].astype(np.int64))
-        tc.append(meta['tg_idx'].astype(np.int64))
-        src.append(meta['tg_is_s3'].astype(np.int8))
-        p1.append(predict(m1, X))
-    sizes = [len(x) for x in p1]
-    s1_code, t_code, src, p1 = (np.concatenate(a) for a in (s1c, tc, src, p1))
-    log(f'stage 1: {len(p1):,} pairs in {len(parts)} parts')
+    # Stage 1 is the slow pass (~1 h on test); its output is cached so a failure
+    # in stage 2 (e.g. the machine running out of memory) does not repeat it.
+    cache = os.path.join(config.CACHE_DIR, split, 'pred_stage1.npz')
+    newest_input = max([os.path.getmtime(os.path.join(MODEL_DIR, 'stage1.txt'))] + [os.path.getmtime(x) for x in parts])
+    if os.path.exists(cache) and os.path.getmtime(cache) > newest_input:
+        with np.load(cache) as z:
+            s1_code, t_code, src, p1, sizes = (z[k] for k in ('s1_code', 't_code', 'src', 'p1', 'sizes'))
+        s1_code, t_code, sizes = s1_code.astype(np.int64), t_code.astype(np.int64), sizes.tolist()
+        log(f'stage 1: reused {len(p1):,} probabilities from {cache}')
+    else:
+        s1c, tc, src, p1 = [], [], [], []
+        for path in parts:
+            meta, X, _ = read_part(path, fl['stage1'])
+            s1c.append(meta['s1_idx'].astype(np.int64))
+            tc.append(meta['tg_idx'].astype(np.int64))
+            src.append(meta['tg_is_s3'].astype(np.int8))
+            p1.append(predict(m1, X))
+        sizes = [len(x) for x in p1]
+        s1_code, t_code, src, p1 = (np.concatenate(a) for a in (s1c, tc, src, p1))
+        log(f'stage 1: {len(p1):,} pairs in {len(parts)} parts')
+        np.savez(cache + '.tmp.npz', s1_code=s1_code.astype(np.int32), t_code=t_code.astype(np.int32),
+                 src=src, p1=p1, sizes=np.array(sizes, np.int64))
+        os.replace(cache + '.tmp.npz', cache)
+        log(f'stage 1 cached -> {cache}')
     ctx = context_features(s1_code, t_code, p1)
     if 'ce' in fl['stage2']:   # model was trained with the cross-encoder member
         ce = ce_features(split, s1_code, t_code)
@@ -496,6 +537,8 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument('--cv', action='store_true')
     mode.add_argument('--fit', action='store_true')
+    ap.add_argument('--stage2-only', action='store_true',
+                    help='with --fit: keep cache/models/stage1.txt, retrain stage 2 only (e.g. after adding cross-encoder scores)')
     mode.add_argument('--predict', action='store_true')
     mode.add_argument('--redecode', action='store_true',
                       help='re-decode saved --predict probabilities with --shift (minutes, no model run)')
@@ -505,7 +548,7 @@ def main():
     if args.cv:
         run_cv(args.split)
     elif args.fit:
-        run_fit(args.split)
+        run_fit(args.split, stage2_only=args.stage2_only)
     elif args.redecode:
         run_redecode(args.split, args.shift)
     else:

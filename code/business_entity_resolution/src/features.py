@@ -187,7 +187,7 @@ def load_truth(split):
 
 def rf(scorer, a, b):
     """Element-wise RapidFuzz scores for two aligned string lists, all cores, 0-1 scale."""
-    return process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32) / np.float32(100)
+    return process.cpdist(a, b, scorer=scorer, workers=config.N_THREADS, dtype=np.float32) / np.float32(100)
 
 
 def pair_rowdot(X, Y, i, j, chunk=1_000_000):
@@ -421,7 +421,7 @@ def build_features(split, chunk):
         f['name_tset'] = rf(fuzz.token_set_ratio, a, b)
         f['name_tsort'] = rf(fuzz.token_sort_ratio, a, b)
         f['name_partial'] = rf(fuzz.partial_ratio, a, b)
-        f['name_jw'] = process.cpdist(a, b, scorer=JaroWinkler.normalized_similarity, workers=-1, dtype=np.float32)
+        f['name_jw'] = process.cpdist(a, b, scorer=JaroWinkler.normalized_similarity, workers=config.N_THREADS, dtype=np.float32)
         f['name_exact'] = (s1n[i] == tgn[j]).astype(np.float32)
         a, b = list(s1a[i]), list(tga[j])
         f['addr_ratio'] = rf(fuzz.ratio, a, b)
