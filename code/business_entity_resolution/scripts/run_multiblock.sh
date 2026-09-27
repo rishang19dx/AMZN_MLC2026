@@ -8,8 +8,8 @@
 #   PIPELINES=classical bash scripts/run_multiblock.sh               # no neural training at all
 #
 # Stages: splits train block_val check_val fit block_test predict validate
-# Overridable: DATA (dir with train/ test/ splits/), ART (artifacts), OUT (outputs), CONFIG,
-#              TRAIN_FRACTION, MATCHER_FRACTION, EPOCHS, DEVICE, PIPELINES, PY
+# Overridable: DATA (dir with train/ test/ splits/), ART (artifacts), OUT (outputs), SAVE_DIR, CONFIG,
+#              TRAIN_FRACTION, MATCHER_FRACTION, PREDICT_FOLDS, EPOCHS, DEVICE, PIPELINES, PY
 set -euo pipefail
 
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,6 +26,20 @@ export BER_DATA_DIR="$DATA"
 export PYTHONUNBUFFERED=1
 
 wanted() { [ -z "${STAGES:-}" ] || [[ " $STAGES " == *" $1 "* ]]; }
+# SAVE_DIR (optional, e.g. /kaggle/working/output): deliverables are copied there as soon as each
+# stage writes them, so a run killed by a time limit still keeps everything finished before it.
+save() {
+    [ -n "${SAVE_DIR:-}" ] || return 0
+    mkdir -p "$SAVE_DIR"
+    local f d name
+    for f in "$@"; do
+        [ -f "$f" ] || continue
+        d="$(basename "$(dirname "$f")")"
+        if [ "$d" = test ]; then name="$(basename "$f")"; else name="${d}_$(basename "$f")"; fi
+        cp "$f" "$SAVE_DIR/$name" && echo "   saved $SAVE_DIR/$name"
+    done
+    return 0
+}
 run() { echo "== $*"; "$@"; }
 cd "$PROJ"
 
@@ -55,16 +69,19 @@ wanted check_val && run "$PY" src/check_blocking.py --candidates "$OUT/local_val
     --json "$OUT/local_val/check_blocking.json"
 
 # 4. LightGBM matcher, grouped K-fold on the holdout candidates, threshold tuned for F0.5
+save "$OUT/local_val/blocking_report.txt" "$OUT/local_val/blocking_report.json" "$OUT/local_val/check_blocking.json"
 wanted fit && run "$PY" src/lgbm_matcher.py fit --data-dir "$DATA/splits/local_val" \
     --candidates-dir "$OUT/local_val" --artifacts-dir "$ART" --train-fraction "$MATCHER_FRACTION" --config "$CONFIG"
 
 # 5. test: candidates, then matches (a subset of the candidates)
 wanted block_test && run "$PY" src/generate_candidates.py --data-dir "$DATA/test" --artifacts-dir "$ART" \
     --output-dir "$OUT/test" --pipelines "$PIPELINES" --config "$CONFIG"
+save "$OUT/test/candidate_pairs.tsv" "$OUT/test/candidate_manifest.json"
 wanted predict && run "$PY" src/lgbm_matcher.py predict --data-dir "$DATA/test" --candidates-dir "$OUT/test" \
-    --artifacts-dir "$ART" --output-dir "$OUT/test" --config "$CONFIG"
+    --artifacts-dir "$ART" --output-dir "$OUT/test" --max-folds "${PREDICT_FOLDS:-0}" --config "$CONFIG"
 
 # 6. official format check
 wanted validate && run python3 "$REPO/utils/validate_submission.py" --matching "$OUT/test/matching_results.tsv" \
     --candidate "$OUT/test/candidate_pairs.tsv" --test-dir "$DATA/test"
+save "$OUT/test/matching_results.tsv" "$OUT/local_val/matching_results_oof.tsv"
 echo "submission files: $OUT/test/matching_results.tsv  $OUT/test/candidate_pairs.tsv"

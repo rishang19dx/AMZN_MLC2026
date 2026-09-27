@@ -293,7 +293,9 @@ def run_fit(args, cfg):
 def run_predict(args, cfg):
     out_dir = os.path.join(args.artifacts_dir, 'matcher')
     mj = read_json(os.path.join(out_dir, 'matcher.json'))
-    models = [lgb.Booster(model_file=os.path.join(out_dir, f'fold{k}.txt')) for k in range(mj['folds'])]
+    n_models = min(mj['folds'], args.max_folds) if args.max_folds else mj['folds']
+    models = [lgb.Booster(model_file=os.path.join(out_dir, f'fold{k}.txt')) for k in range(n_models)]
+    log(f'using {n_models} of {mj["folds"]} fold models')
     data, parts, rec, hub = prepare(args, cfg)
     nt = n_workers(cfg['runtime'].get('workers', 0))
     s1s, tgs, ps = [], [], []
@@ -325,6 +327,8 @@ def main(argv=None):
     ap.add_argument('--train-fraction', type=float, default=None, help='fit: random fraction of Source 1 entities')
     ap.add_argument('--folds', type=int, default=None)
     ap.add_argument('--threshold', type=float, default=None, help='predict: override the tuned threshold')
+    ap.add_argument('--max-folds', type=int, default=0,
+                    help='predict: average only the first N fold models (0 = all); N=1 is ~N_folds x faster')
     add_config_args(ap)
     args = ap.parse_args(argv)
     args.output_dir = args.output_dir or args.candidates_dir
