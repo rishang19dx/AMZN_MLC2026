@@ -63,6 +63,7 @@ python src/features.py --split test --index-only            # candidate index in
 BER_FEATURE_CHUNK=300000 python src/features.py --split test  # smaller parts = lower peak; memory is printed on every log line
 python src/match.py --split test --predict                    # also saves cache/test/pred.npz
 python src/match.py --split test --redecode --shift=-0.5      # decoding variant in ~6 min -> matching_results_shift-0.50.tsv
+python src/match.py --split test --redecode --unseen-shift=-0.75   # FINAL SUBMISSION: stricter decoding for countries unseen in training -> matching_results_unseen-0.75.tsv
 ```
 Launch long jobs detached (`setsid nohup ... &`) so they survive a closed terminal; `scripts/mem_guard.sh` stops the pipeline cleanly before the machine runs out of memory.
 

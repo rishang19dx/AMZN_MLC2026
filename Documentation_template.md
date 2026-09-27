@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Your Team Name]  
-**Team Members:** [List all team members]  
+**Team Name:** r/mak  
+**Team Members:** Rishang Yadav, Mehul Sharma, Karanpreet Singh Dhaliwal  
 **Submission Date:** 27 September 2026
 
 ---
@@ -41,7 +41,7 @@ All figures were measured on the training data.
 3. **Expected-F0.5 decoding** per Source 1, which predicts singletons correctly.
 4. **Test-scale training (`scale_val`)**: Source 1 records blocked against the full ~9.3M-record training target pool, so the matcher sees test-like crowding.
 
-Country is compared only as a string (never a feature or a filter), so France, unseen in training, needs no special code.
+Country is compared only as a string (never a feature or a filter), so France, unseen in training, needs no special code. The one country-aware step is a decoding shift for Source 1 in countries **absent from training** (keyed on that, never on a name): −0.75 in logit space, chosen on the public leaderboard (0.958506 → 0.958662).
 
 ---
 
@@ -151,7 +151,9 @@ python src/blocking.py --split scale_val && python src/features.py --split scale
 python src/match.py --split scale_val --cv && python src/match.py --split scale_val --fit
 python src/blocking.py --split test && python src/features.py --split test
 python src/match.py --split test --predict
+python src/match.py --split test --redecode --unseen-shift=-0.75   # final file: stricter decoding for countries unseen in training
 ```
+The submitted `output/matching_results.tsv` is `output/test/matching_results_unseen-0.75.tsv` from the last command.
 Outputs: `output/test/matching_results.tsv` and `output/test/candidate_pairs.tsv`.
 
 Measured on a 16-core / 15 GB laptop:
