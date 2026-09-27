@@ -239,15 +239,17 @@ def generate_candidates(split, s1, tg, ks, max_df, workers=1):
             r, c, v = run_pass(field_text(s1_c, fields), field_text(tg_c, fields), ks[pname], max_df, kw, workers)
             part = pd.DataFrame({'s1': s1_idx[r], 'tg': tg_idx[c],
                                  f'score_{pname}': v, f'rank_{pname}': rank_within(r, v)})
-            duckdb.from_df(part).write_parquet(path + '.tmp')
+            duckdb.from_df(part).write_parquet(path + '.tmp', compression='zstd')
             os.replace(path + '.tmp', path)
             log(f'  {country:>8} {pname:>4}: {len(s1_c):,} x {len(tg_c):,} -> {len(part):,} pairs')
             del part, r, c, v
     return part_dir
 
 
-def write_outputs(split, s1, tg, part_dir, ks):
-    """Merge the parts on disk (DuckDB) into candidates.parquet + candidate_pairs.tsv."""
+def write_outputs(split, s1, tg, part_dir, ks, tsv=True):
+    """Merge the parts on disk (DuckDB) into candidates.parquet + candidate_pairs.tsv.
+    tsv=False (--no-tsv) stops after candidates.parquet, for a machine with little
+    disk; `--tsv-only` then writes the TSV from the parquet wherever it is copied."""
     con = duck(split)
     con.register('s1x', pd.DataFrame({'s1': np.arange(len(s1), dtype=np.int32), 's1_id': s1['entity_id']}))
     con.register('tgx', pd.DataFrame({'tg': np.arange(len(tg), dtype=np.int32), 'cand_id': tg['entity_id']}))
@@ -269,23 +271,44 @@ def write_outputs(split, s1, tg, part_dir, ks):
     con.execute(f"""COPY (SELECT s1x.s1_id, tgx.cand_id, {score_cols}
         FROM pairs p JOIN s1x USING (s1) JOIN tgx USING (tg) ORDER BY p.s1, p.tg)
         TO '{pq}' (FORMAT parquet, COMPRESSION zstd)""")
+    # the parts are merged into `pairs` (held by DuckDB): free their disk before the TSV
+    shutil.rmtree(part_dir, ignore_errors=True)
+    log(f'wrote {pq}')
+    if tsv:
+        _write_tsv(con, split, n, """SELECT s1x.s1_id, string_agg(tgx.cand_id, ',' ORDER BY tgx.cand_id)
+            FROM s1x LEFT JOIN pairs p USING (s1) LEFT JOIN tgx ON p.tg = tgx.tg
+            GROUP BY s1x.s1, s1x.s1_id ORDER BY s1x.s1""")
+    shutil.rmtree(os.path.join(cache_dir, 'duckdb_tmp'), ignore_errors=True)
 
+
+def write_tsv_from_parquet(split):
+    """--tsv-only: candidate_pairs.tsv from an existing candidates.parquet (e.g. one
+    produced elsewhere with --no-tsv). Same rows and order as write_outputs."""
+    s1_ids = read_tsv(config.split_paths(split)['s1'], usecols=['entity_id'])['entity_id']
+    con = duck(split)
+    con.register('s1x', pd.DataFrame({'s1': np.arange(len(s1_ids), dtype=np.int32), 's1_id': s1_ids}))
+    pq = os.path.join(config.CACHE_DIR, split, 'candidates.parquet')
+    n = con.execute(f"SELECT count(*) FROM read_parquet('{pq}')").fetchone()[0]
+    _write_tsv(con, split, n, f"""SELECT s1x.s1_id, string_agg(c.cand_id, ',' ORDER BY c.cand_id)
+        FROM s1x LEFT JOIN read_parquet('{pq}') c USING (s1_id)
+        GROUP BY s1x.s1, s1x.s1_id ORDER BY s1x.s1""")
+    shutil.rmtree(os.path.join(config.CACHE_DIR, split, 'duckdb_tmp'), ignore_errors=True)
+
+
+def _write_tsv(con, split, n_pairs, query):
+    """Every S1 gets a row, in file order; then the completion marker."""
     out_dir = os.path.join(config.OUTPUT_DIR, split)
     os.makedirs(out_dir, exist_ok=True)
     tsv = os.path.join(out_dir, 'candidate_pairs.tsv')
-    cur = con.execute("""SELECT s1x.s1_id, string_agg(tgx.cand_id, ',' ORDER BY tgx.cand_id)
-        FROM s1x LEFT JOIN pairs p USING (s1) LEFT JOIN tgx ON p.tg = tgx.tg
-        GROUP BY s1x.s1, s1x.s1_id ORDER BY s1x.s1""")        # every S1 gets a row, in file order
+    cur = con.execute(query)
     with open(tsv, 'w', encoding='utf-8') as f:
         f.write('source1_entity_id\tcandidate_entity_ids\n')
         while rows := cur.fetchmany(50_000):
             f.writelines(f'{a}\t{b or ""}\n' for a, b in rows)
     # completion marker, written last: run_pipeline.sh only skips blocking when it exists
-    with open(os.path.join(cache_dir, 'blocking.done'), 'w') as f:
-        f.write(f'{n}\n')
-    shutil.rmtree(part_dir, ignore_errors=True)
-    shutil.rmtree(os.path.join(cache_dir, 'duckdb_tmp'), ignore_errors=True)
-    log(f'wrote {tsv} and {pq}')
+    with open(os.path.join(config.CACHE_DIR, split, 'blocking.done'), 'w') as f:
+        f.write(f'{n_pairs}\n')
+    log(f'wrote {tsv}')
 
 
 def report_by_pass(split, tg):
@@ -317,12 +340,18 @@ def main():
                     help='drop features present in more than this fraction of targets. Lower is much faster '
                          'but costs recall (0.005: -1.7pt, 0.001: -8.8pt on the full pass, local_val)')
     ap.add_argument('--workers', type=int, default=config.N_THREADS)
+    ap.add_argument('--no-tsv', action='store_true',
+                    help='stop after candidates.parquet (little disk); write the TSV later with --tsv-only')
+    ap.add_argument('--tsv-only', action='store_true', help='only write candidate_pairs.tsv from candidates.parquet')
     args = ap.parse_args()
 
+    if args.tsv_only:
+        write_tsv_from_parquet(args.split)
+        return
     s1, tg = load_split(args.split)
     ks = {'name': args.k_name, 'addr': args.k_addr, 'full': args.k_full}
     part_dir = generate_candidates(args.split, s1, tg, ks, args.max_df, args.workers)
-    write_outputs(args.split, s1, tg, part_dir, ks)
+    write_outputs(args.split, s1, tg, part_dir, ks, tsv=not args.no_tsv)
     if os.path.exists(config.split_paths(args.split)['gt']):
         report_by_pass(args.split, tg)
 

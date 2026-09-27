@@ -16,3 +16,5 @@ transformers==5.17.0
 tokenizers==0.23.2
 safetensors==0.8.0
 sentence-transformers==6.1.0
+sentencepiece==0.2.2    # mDeBERTa tokenizer (cross_encoder.py)
+protobuf==7.36.2

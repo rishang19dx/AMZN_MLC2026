@@ -95,6 +95,21 @@ Same code; only paths change, through environment variables read by `src/config.
 
    For long jobs on Kaggle, use *Save Version*: it keeps running after you close the browser.
 
+## Running on airawat (shared 224-thread node; CPU jobs only)
+
+We may only use our **home quota** there (10 GB hard, **9.2 GB soft**, ~5.2 GB already used). So: CPU jobs only (a CUDA torch alone is ~5 GB), one job at a time, inputs gzipped, results copied back and the job folder cleaned. Everything goes into `/home/s25017/scratch/s25017`, in sub-folders the scripts create there (`repo venv jobs tmp .cache`, marker `.ber_owned`); they refuse to start if any of those names already exists without the marker, never touch other files there, and `clean` removes only `jobs/<split>`.
+
+| Step | Where | Command |
+|---|---|---|
+| push code + set up the lean venv (~0.45 GB, once) | laptop | `bash scripts/airawat.sh <ssh-target> code` |
+| push one split's inputs (gzipped; refuses if inputs + outputs would not fit under the soft limit) | laptop | `bash scripts/airawat.sh <ssh-target> data <split>` |
+| run a job (48 pinned CPUs, nice, survives logout; **quota watchdog** stops it 150 MB before the soft limit) | airawat | `bash /home/s25017/scratch/s25017/repo/code/business_entity_resolution/scripts/ber_remote.sh run <split> <name> python src/blocking.py --split <split> --no-tsv` |
+| progress / quota | either | `... ber_remote.sh status` (airawat) or `airawat.sh <ssh-target> status` |
+| results back to `<repo>/from_airawat/<split>/` (laptop `cache/` untouched) | laptop | `bash scripts/airawat.sh <ssh-target> pull <split>` |
+| free the space (only our job folder) | airawat | `... ber_remote.sh clean <split>` |
+
+Test blocking runs with `--no-tsv` there (the 1.3 GB TSV would not fit); after copying `candidates.parquet` into the laptop's `cache/test/`, write it with `python src/blocking.py --split test --tsv-only`. Source TSVs may be `.tsv.gz` anywhere (`config.split_paths` falls back to them). The GPU cross-encoder stays on Kaggle (`airawat_ce.sh` assumes `/storage`, which we may not use).
+
 ## Git workflow
 
 Branch from `main` per task (`feat/<task>`, e.g. `feat/t3-features`), open the PR against `main`, and update the status table in `docs/PIPELINE.md` when it lands. Generated files (`output/`, `cache/`, `dataset/`, `*.tar.zst`) are git-ignored.
