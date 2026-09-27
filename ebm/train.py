@@ -1,21 +1,25 @@
 """
 Train the pair energy model (v2) on a preprocessed cache (ebm.preprocess).
 
-Per step, for B anchor Source 1 records (train split, with >= 1 match):
+The model is a RANKER: it scores candidates produced by ebm.block, never
+searches. Per step, for B anchor Source 1 records (train split, >= 1 match,
+blocked):
   positive   one of its true targets (random)
-  hard negs  K same-country look-alikes that share a rare name word or the
-             house number with the anchor (inverted index over targets), and
-             are not its matches. Every target has at most one Source 1, so
-             "owner != anchor" rules out false negatives exactly.
+  negatives  K from the anchor's OWN candidate pool (its blocked non-matches:
+             exactly what it must reject at test time; the whole pool is
+             used across steps), plus a --mined-share of same-country
+             look-alikes from the inverted index. Every target has at most
+             one Source 1, so "owner != anchor" rules out false negatives.
 Loss:
   listwise   cross-entropy of -E over [positive, K hard negatives]
   BCE        on the same pairs (keeps sigmoid(-E) calibrated)
   in-batch   InfoNCE of the bi-encoder (anchor vs all positives in the batch)
 
-Validation (realistic, unlike random negatives): held-out Source 1 records
-(incl. singletons) against their true targets plus up to --val-negs mined
-look-alikes; reports macro F0.5 at the best global threshold, pair AUC, and
-the share of anchors whose best-scored candidate is a true match.
+Validation (end to end): up to --val-anchors held-out Source 1 (incl.
+singletons) with their FULL candidate lists; true pairs that blocking missed
+count as misses. Decoding = one Source 1 per target (among the validation
+anchors) + per-source caps + a global threshold, chosen here and reused by
+ebm.predict.
 
 Usage:
   python -m ebm.train --cache cache/train --out artifacts/ebm_v2
@@ -44,6 +48,7 @@ class Data:
             self.meta = json.load(f)
         self.tokens, self.fields = load('tokens'), load('fields')
         self.country, self.val = load('country'), load('val')
+        self.source = load('source')
         self.indptr, self.targets, self.owner = load('gt_indptr'), load('gt_targets'), load('owner')
         self.n, self.n_s1 = self.meta['n'], self.meta['n_s1']
         counts = np.diff(self.indptr)
@@ -51,6 +56,33 @@ class Data:
         self.train_anchors = s1[(~self.val) & (counts > 0)]
         self.val_anchors = s1[self.val]
         self._build_index(max_df)
+        self._load_candidates(cache)
+
+    def _load_candidates(self, cache):
+        z = np.load(os.path.join(cache, 'candidates.npz'))
+        order = np.lexsort((z['tg'], z['s1']))
+        self.c_s1, self.c_tg = z['s1'][order], z['tg'][order]
+        self.c_start = np.searchsorted(self.c_s1, np.arange(self.n_s1 + 1))
+        blocked = np.diff(self.c_start) > 0
+        self.train_anchors = self.train_anchors[blocked[self.train_anchors]]
+        self.val_anchors = self.val_anchors[blocked[self.val_anchors]]
+        log(f'candidates: {len(self.c_s1):,} pairs; {len(self.train_anchors):,} blocked train anchors, '
+            f'{len(self.val_anchors):,} blocked validation Source 1')
+
+    def candidate_negatives(self, anchors, k, mined_share, rng):
+        n_pool = k - int(round(k * mined_share))
+        out = np.empty((len(anchors), k), np.int64)
+        mined = self.hard_negatives(anchors, k, rng)
+        for i, a in enumerate(anchors):
+            pool = self.c_tg[self.c_start[a]:self.c_start[a + 1]]
+            pool = pool[self.owner[pool] != a]
+            take = pool[rng.permutation(len(pool))[:n_pool]] if len(pool) else pool
+            rest = [x for x in mined[i] if x not in set(take)][:k - len(take)]
+            row = list(take) + rest
+            while len(row) < k:
+                row.append(mined[i][len(row) % k])
+            out[i] = row[:k]
+        return out
 
     def _keys(self, rows):
         """Mining keys: (country, token) for name-word and house-number tokens."""
@@ -76,8 +108,8 @@ class Data:
         self.ukeys, self.kstart, self.kcount, self.postings = uk[good], start[good], cnt[good], rows
         # per-country target lists for the random fallback
         c = self.country[tg]
-        self.c_order = tg[np.argsort(c, kind='stable')]
-        self.c_start = np.searchsorted(np.sort(c), np.arange(len(self.meta['countries']) + 1))
+        self.cty_order = tg[np.argsort(c, kind='stable')]
+        self.cty_start = np.searchsorted(np.sort(c), np.arange(len(self.meta['countries']) + 1))
         log(f'mining index: {len(self.ukeys):,} keys (df 2..{max_df}), {int(self.kcount.sum()):,} postings')
 
     def positives(self, anchors, rng):
@@ -102,8 +134,8 @@ class Data:
                     got.append(cand)
             while len(got) < k:                                      # random same-country fallback
                 c = self.country[anchors[i]]
-                lo, hi = self.c_start[c], self.c_start[c + 1]
-                cand = self.c_order[lo + rng.integers(max(hi - lo, 1))] if hi > lo else self.n_s1
+                lo, hi = self.cty_start[c], self.cty_start[c + 1]
+                cand = self.cty_order[lo + rng.integers(max(hi - lo, 1))] if hi > lo else self.n_s1
                 if self.owner[cand] != anchors[i]:
                     got.append(cand)
             out[i] = got
@@ -115,31 +147,52 @@ class Data:
         return t, f
 
 
-def macro_f05(scores, labels, groups, n_groups, thr):
-    pred = scores >= thr
-    tp = np.bincount(groups, weights=pred & (labels == 1), minlength=n_groups)
-    pp = np.bincount(groups, weights=pred, minlength=n_groups)
-    ap = np.bincount(groups, weights=labels, minlength=n_groups)
+CAPS = {2: 5, 3: 6}          # max matches per Source 1 from S2 / S3 (train maxima)
+
+
+def decode(s1, tg, p, source, thr):
+    """One Source 1 per target (highest p), per-source caps, threshold -> kept mask."""
+    keep = np.zeros(len(p), bool)
+    order = np.lexsort((-p, tg))                          # per target, best first
+    first = np.r_[True, tg[order][1:] != tg[order][:-1]]
+    best = order[first]
+    best = best[p[best] >= thr]
+    keep[best] = True
+    # caps: per (s1, source) keep the highest-p ones
+    idx = np.flatnonzero(keep)
+    o = idx[np.lexsort((-p[idx], source[tg[idx]], s1[idx]))]
+    grp = s1[o].astype(np.int64) * 4 + source[tg[o]]
+    rank = np.arange(len(o)) - np.searchsorted(grp, grp)   # grp is sorted within o
+    cap = np.where(source[tg[o]] == 2, CAPS[2], CAPS[3])
+    keep[o[rank >= cap]] = False
+    return keep
+
+
+def f05_per_entity(s1_rows, kept_s1, kept_tp, truth_count):
+    """Macro F0.5 over s1_rows (singletons included), given kept pairs and their correctness."""
+    n = len(s1_rows)
+    pos = {r: i for i, r in enumerate(s1_rows)}
+    g = np.array([pos[x] for x in kept_s1], np.int64) if len(kept_s1) else np.array([], np.int64)
+    tp = np.bincount(g, weights=kept_tp, minlength=n)
+    pp = np.bincount(g, minlength=n)
+    ap = truth_count
     f = np.where(ap == 0, (pp == 0).astype(float), 0.0)
     ok = (ap > 0) & (tp > 0)
-    p, r = tp[ok] / pp[ok], tp[ok] / ap[ok]
-    f[ok] = 1.25 * p * r / (0.25 * p + r)
+    pr, rc = tp[ok] / pp[ok], tp[ok] / ap[ok]
+    f[ok] = 1.25 * pr * rc / (0.25 * pr + rc)
     return f.mean()
 
 
 @torch.no_grad()
-def validate(model, data, device, n_anchors, n_negs, bs, seed):
+def validate(model, data, device, n_anchors, bs, seed):
     rng = np.random.default_rng(seed)
-    anchors = rng.choice(data.val_anchors, min(n_anchors, len(data.val_anchors)), replace=False)
-    a_rows, b_rows, labels, groups = [], [], [], []
-    negs = data.hard_negatives(anchors, n_negs, rng)
-    for g, a in enumerate(anchors):
-        pos = data.targets[data.indptr[a]:data.indptr[a + 1]]
-        cands = list(pos) + [x for x in negs[g] if x not in set(pos)]
-        a_rows += [a] * len(cands); b_rows += cands
-        labels += [1] * len(pos) + [0] * (len(cands) - len(pos)); groups += [g] * len(cands)
-    a_rows, b_rows = np.array(a_rows), np.array(b_rows)
-    labels, groups = np.array(labels), np.array(groups)
+    anchors = data.val_anchors if not n_anchors or n_anchors >= len(data.val_anchors) else \
+        np.sort(rng.choice(data.val_anchors, n_anchors, replace=False))
+    lo, hi = data.c_start[anchors], data.c_start[anchors + 1]
+    sel = np.concatenate([np.arange(a, b) for a, b in zip(lo, hi)])
+    a_rows, b_rows = data.c_s1[sel], data.c_tg[sel]
+    labels = (data.owner[b_rows] == a_rows)
+    truth = np.diff(data.indptr)[anchors]                  # incl. pairs blocking missed
     model.eval()
     out = []
     for s in range(0, len(a_rows), bs):
@@ -149,13 +202,16 @@ def validate(model, data, device, n_anchors, n_negs, bs, seed):
             out.append(torch.sigmoid(-model(ta, fa, tb, fb)).float().cpu().numpy())
     p = np.concatenate(out)
     from sklearn.metrics import roc_auc_score
-    auc = roc_auc_score(labels, p)
-    best = max((macro_f05(p, labels, groups, len(anchors), t), t) for t in np.linspace(0.05, 0.95, 19))
-    top = np.zeros(len(anchors)); np.maximum.at(top, groups, p)
-    has = np.bincount(groups, weights=labels, minlength=len(anchors)) > 0
-    top_is_pos = np.array([labels[(groups == g)][np.argmax(p[groups == g])] == 1 for g in np.flatnonzero(has)])
+    auc = roc_auc_score(labels, p) if 0 < labels.mean() < 1 else float('nan')
+    res = []
+    for t in np.linspace(0.05, 0.95, 19):
+        k = decode(a_rows, b_rows, p, data.source, t)
+        res.append((f05_per_entity(anchors, a_rows[k], labels[k].astype(float), truth), t))
+    best = max(res)
+    ceiling = f05_per_entity(anchors, a_rows[labels], np.ones(int(labels.sum())), truth)
     model.train()
-    return {'macro_f05': best[0], 'threshold': float(best[1]), 'auc': auc, 'top1_is_match': float(top_is_pos.mean()),
+    return {'macro_f05': best[0], 'threshold': float(best[1]), 'auc': auc, 'ceiling': ceiling,
+            'blocking_recall': float(labels.sum() / max(truth.sum(), 1)),
             'anchors': len(anchors), 'pairs': len(labels), 'pos_share': float(labels.mean())}
 
 
@@ -169,14 +225,14 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--batch', type=int, default=512, help='anchors per step')
-    ap.add_argument('--hard', type=int, default=7, help='hard negatives per anchor')
+    ap.add_argument('--hard', type=int, default=15, help='negatives per anchor per step (from its candidate pool)')
+    ap.add_argument('--mined-share', type=float, default=0.25, help='share of those from mined look-alikes')
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--d', type=int, default=128)
     ap.add_argument('--layers', type=int, default=2)
-    ap.add_argument('--max-df', type=int, default=2000)
+    ap.add_argument('--max-df', type=int, default=5000, help='mining index: max targets per key')
     ap.add_argument('--inbatch-weight', type=float, default=0.5)
-    ap.add_argument('--val-anchors', type=int, default=20000)
-    ap.add_argument('--val-negs', type=int, default=20)
+    ap.add_argument('--val-anchors', type=int, default=50000, help='0 = all validation Source 1')
     ap.add_argument('--val-every', type=int, default=1000)
     ap.add_argument('--max-steps', type=int, default=0, help='smoke tests')
     ap.add_argument('--mmap', action='store_true', help='memory-map tokens (low-RAM machines)')
@@ -206,7 +262,7 @@ def main():
         for s in range(0, steps_per_epoch * args.batch, args.batch):
             A = order[s:s + args.batch]
             P = data.positives(A, rng)
-            N = data.hard_negatives(A, args.hard, rng)               # [B, K]
+            N = data.candidate_negatives(A, args.hard, args.mined_share, rng)   # [B, K]
             ta, fa = data.batch(A, device)
             tp, fp = data.batch(P, device)
             tn, fn = data.batch(N.reshape(-1), device)
@@ -234,10 +290,11 @@ def main():
                 log(f'epoch {epoch} step {step}/{total} loss {loss.item():.4f} (list {listwise.item():.3f} '
                     f'bce {bce.item():.3f} inbatch {inbatch.item():.3f}) lr {sched.get_last_lr()[0]:.2e}')
             if step % args.val_every == 0 or step == total:
-                v = validate(model, data, device, args.val_anchors, args.val_negs, 4096, args.seed)
+                v = validate(model, data, device, args.val_anchors, 4096, args.seed)
                 v.update(step=step, epoch=epoch); hist.append(v)
-                log(f'VALIDATION step {step}: macro F0.5 {v["macro_f05"]:.4f} @ {v["threshold"]:.2f}  '
-                    f'AUC {v["auc"]:.4f}  top-1 is a match {v["top1_is_match"]:.3f}  ({v["pairs"]:,} pairs)')
+                log(f'VALIDATION step {step}: macro F0.5 {v["macro_f05"]:.4f} @ {v["threshold"]:.2f} '
+                    f'(ceiling {v["ceiling"]:.4f}, blocking recall {v["blocking_recall"]:.4f})  AUC {v["auc"]:.4f}  '
+                    f'{v["anchors"]:,} Source 1, {v["pairs"]:,} pairs')
                 if v['macro_f05'] > best:
                     best = v['macro_f05']
                     torch.save({'model': model.state_dict(), 'args': vars(args), 'meta': m, 'validation': v},
