@@ -58,8 +58,15 @@ def split_paths(name):
     d = os.path.join(DATA_DIR, name) if name in ('train', 'test') else os.path.join(SPLITS_DIR, name)
     return {
         'dir': d,
-        's1': os.path.join(d, f'{name}_source1.tsv'),
-        's2': os.path.join(d, f'{name}_source2.tsv'),
-        's3': os.path.join(d, f'{name}_source3.tsv'),
+        's1': _plain_or_gz(os.path.join(d, f'{name}_source1.tsv')),
+        's2': _plain_or_gz(os.path.join(d, f'{name}_source2.tsv')),
+        's3': _plain_or_gz(os.path.join(d, f'{name}_source3.tsv')),
         'gt': os.path.join(d, f'{name}_ground_truth.tsv'),
     }
+
+
+def _plain_or_gz(path):
+    """The .tsv if present, else its .tsv.gz (read_tsv/pandas decompresses it).
+    Source files are shipped gzipped to the space-limited cluster; the ground
+    truth stays plain because evaluate.py reads it with open()."""
+    return path if os.path.exists(path) or not os.path.exists(path + '.gz') else path + '.gz'

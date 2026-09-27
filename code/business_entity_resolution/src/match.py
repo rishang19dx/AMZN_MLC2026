@@ -194,13 +194,19 @@ def stage2_matrix(split, pairs_or_codes, X, p1):
 
 
 def context_features(s1_code, t_code, p1):
-    """Stage-2 context, columns in CONTEXT order."""
+    """Stage-2 context, columns in CONTEXT order. Columns are written straight
+    into one preallocated float32 matrix (the old column_stack + astype made two
+    extra full copies: ~9 GB peak on test's 65M pairs, OOM-killed twice)."""
+    out = np.empty((len(p1), 11), np.float32)
+    out[:, 0] = p1
     r, t1, t2, s, n50 = group_stats(s1_code, p1)
-    cols = [p1, r, t1 - p1, t1, t1 - t2, s, n50]
+    out[:, 1], out[:, 2], out[:, 3], out[:, 4], out[:, 5], out[:, 6] = r, t1 - p1, t1, t1 - t2, s, n50
+    del r, t1, t2, s, n50
     r, t1, t2, s, n50 = group_stats(t_code, p1)
-    other_best = np.where(r == 1, t2, t1)          # best competing Source 1 for this target
-    cols += [r, p1 - other_best, t1, n50]
-    return np.column_stack(cols).astype(np.float32)
+    out[:, 7] = r
+    out[:, 8] = p1 - np.where(r == 1, t2, t1)      # margin over the best competing Source 1 for this target
+    out[:, 9], out[:, 10] = t1, n50
+    return out
 
 
 # ---------------------------------------------------------------------------

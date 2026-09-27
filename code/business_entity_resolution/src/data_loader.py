@@ -36,6 +36,15 @@ GT_COLUMNS = ['source1_entity_id', 'matched_entity_ids']
 SOURCE_COLUMNS = ['entity_id', 'business_name', 'business_address', 'country']
 
 
+def open_text(path):
+    """Open a challenge TSV for line-by-line reading; `.gz` files (shipped to the
+    space-limited cluster, see config.split_paths) are decompressed on the fly."""
+    if path.endswith('.gz'):
+        import gzip
+        return gzip.open(path, 'rt', encoding='utf-8')
+    return open(path, encoding='utf-8')
+
+
 def read_tsv(path, **kwargs):
     """
     Read a challenge TSV with pandas. Quote handling is disabled because the

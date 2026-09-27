@@ -15,3 +15,7 @@ dataset/
 cache/
 *.tar.zst
 *.tar.zst.sha256
+
+# airawat staging and returned results (scripts/airawat.sh)
+transfer/
+from_airawat/

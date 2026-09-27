@@ -92,10 +92,18 @@ def read_ground_truth(path):
     return gt
 
 
+def _open_source(path):
+    """Source TSVs may be gzipped (config.split_paths falls back to .tsv.gz)."""
+    if path.endswith('.gz'):
+        import gzip
+        return gzip.open(path, 'rt', encoding='utf-8')
+    return open(path, encoding='utf-8')
+
+
 def read_country_map(path):
     """entity_id -> country for one source file (streams; no pandas needed)."""
     out = {}
-    with open(path, encoding='utf-8') as f:
+    with _open_source(path) as f:
         next(f)
         for line in f:
             parts = line.rstrip('\n').split('\t')
@@ -106,7 +114,7 @@ def read_country_map(path):
 def count_countries(*paths):
     counts = Counter()
     for path in paths:
-        with open(path, encoding='utf-8') as f:
+        with _open_source(path) as f:
             next(f)
             for line in f:
                 counts[line.rstrip('\n').rsplit('\t', 1)[-1]] += 1

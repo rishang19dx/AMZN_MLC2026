@@ -54,7 +54,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from data_loader import read_tsv
+from data_loader import open_text, read_tsv
 from normalize import is_non_latin, norm
 
 _NUM = re.compile(r'\d+')
@@ -96,7 +96,7 @@ def load_records(split):
     def read(paths):
         ids, names, addrs, missing, nonlatin = [], [], [], [], []
         for path in paths:
-            with open(path, encoding='utf-8') as f:
+            with open_text(path) as f:
                 header = next(f).rstrip('\n').split('\t')
                 assert header[:3] == ['entity_id', 'business_name', 'business_address'], header
                 for line in f:
@@ -139,7 +139,7 @@ def load_candidate_index(split, s1_ids, tg_ids):
 def _read_ids(paths):
     ids = []
     for path in paths:
-        with open(path, encoding='utf-8') as f:
+        with open_text(path) as f:
             next(f)
             ids.extend(line.split('\t', 1)[0] for line in f if line != '\n')
     return np.array(ids, dtype=object)
