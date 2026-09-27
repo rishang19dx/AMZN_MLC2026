@@ -2,6 +2,8 @@
 # Pair energy model v2, complete pipeline on airawat (one GPU, capped CPU threads).
 #
 #   ROOT=/scratch/s25017 bash ebm/run_airawat.sh          # from the folder that contains ebm/
+#   ROOT=... TRAIN_CANDIDATES=scale_val_candidate_pairs.tsv.gz TEST_CANDIDATES=test_candidate_pairs.tsv.gz \
+#       bash ebm/run_airawat.sh                            # reuse existing blocking (skips steps 2-3)
 #
 #   1. preprocess train (+ native-script dictionary from train pairs) and test
 #   2. block train: S1_FRACTION of train-split Source 1 + ALL validation Source 1,
@@ -27,10 +29,23 @@ say "1. preprocess"
 [ -f "$CACHE/train/meta.json" ] || $PY -m ebm.preprocess --split-dir "$DATA/train" --prefix train --out "$CACHE/train" --learn-dictionary
 [ -f "$CACHE/test/meta.json" ]  || $PY -m ebm.preprocess --split-dir "$DATA/test" --prefix test --out "$CACHE/test" --dictionary "$CACHE/train/translit.json"
 
-say "2. block train (S1 fraction ${S1_FRACTION:-0.3} + all validation Source 1)"
-[ -f "$CACHE/train/candidates.npz" ] || $PY -m ebm.block --cache "$CACHE/train" --k-addr "$K_ADDR" --k-full "$K_FULL" --s1-fraction "${S1_FRACTION:-0.3}"
-say "3. block test"
-[ -f "$CACHE/test/candidates.npz" ] || $PY -m ebm.block --cache "$CACHE/test" --k-addr "$K_ADDR" --k-full "$K_FULL"
+# Candidates: import existing ones (TRAIN_CANDIDATES / TEST_CANDIDATES, e.g. the
+# main pipeline's scale_val and test candidate_pairs.tsv behind the 0.959
+# submission) or block from scratch.
+if [ -n "${TRAIN_CANDIDATES:-}" ]; then
+    say "2. import train candidates: $TRAIN_CANDIDATES"
+    [ -f "$CACHE/train/candidates.npz" ] || $PY -m ebm.import_candidates --cache "$CACHE/train" --candidates "$TRAIN_CANDIDATES"
+else
+    say "2. block train (S1 fraction ${S1_FRACTION:-0.3} + all validation Source 1)"
+    [ -f "$CACHE/train/candidates.npz" ] || $PY -m ebm.block --cache "$CACHE/train" --k-addr "$K_ADDR" --k-full "$K_FULL" --s1-fraction "${S1_FRACTION:-0.3}"
+fi
+if [ -n "${TEST_CANDIDATES:-}" ]; then
+    say "3. import test candidates: $TEST_CANDIDATES"
+    [ -f "$CACHE/test/candidates.npz" ] || $PY -m ebm.import_candidates --cache "$CACHE/test" --candidates "$TEST_CANDIDATES"
+else
+    say "3. block test"
+    [ -f "$CACHE/test/candidates.npz" ] || $PY -m ebm.block --cache "$CACHE/test" --k-addr "$K_ADDR" --k-full "$K_FULL"
+fi
 
 if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
     CUDA_VISIBLE_DEVICES=$(timeout 20 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null \
