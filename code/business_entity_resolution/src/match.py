@@ -524,16 +524,35 @@ def run_predict(split, shift=None):
     log(f'{int(chosen.sum()):,} matches ({choice["method"]}, param {param}) -> {path}')
 
 
-def run_redecode(split, shift):
-    """Re-decode saved --predict probabilities with another logit shift; writes
-    matching_results_shift<shift>.tsv next to the main file (which stays untouched)."""
+def unseen_country_rows(split, s1_code):
+    """Pairs whose Source 1 country never occurs in the training Source 1 (on test:
+    France). Keyed on 'unseen in training', never on a country name."""
+    from data_loader import read_tsv
+    seen = set(read_tsv(config.TRAIN_S1, usecols=['country'])['country'].unique())
+    c = read_tsv(config.split_paths(split)['s1'], usecols=['country'])['country'].to_numpy()
+    unseen = ~np.isin(c, list(seen))
+    log(f'unseen countries: {sorted(set(c[unseen]))} ({int(unseen.sum()):,} Source 1)')
+    return unseen[s1_code]
+
+
+def run_redecode(split, shift, unseen_shift=None):
+    """Re-decode saved --predict probabilities with another logit shift, optionally a
+    separate one for Source 1 in countries unseen in training; writes a new
+    matching_results_*.tsv next to the main file (which stays untouched)."""
     with open(os.path.join(MODEL_DIR, 'decode.json')) as f:
         choice = json.load(f)
     with np.load(os.path.join(config.CACHE_DIR, split, 'pred.npz')) as z:
         s1_code, t_code, src, p2 = (z[k] for k in ('s1_code', 't_code', 'src', 'p2'))
     param = choice['param'] if shift is None else shift
+    name = f'matching_results_shift{param:+.2f}.tsv'
+    if unseen_shift is not None and choice['method'] != 'threshold':
+        rows = unseen_country_rows(split, s1_code)
+        p2 = logit_shift(p2, param)                        # seen countries: the chosen shift
+        p2[rows] = logit_shift(p2[rows], unseen_shift)     # unseen: an extra shift on top
+        param = 0.0
+        name = f'matching_results_unseen{unseen_shift:+.2f}.tsv'
     chosen = decode(s1_code.astype(np.int64), t_code.astype(np.int64), src, p2, choice['method'], param)
-    path = write_matches(split, s1_code, t_code, chosen, name=f'matching_results_shift{param:+.2f}.tsv')
+    path = write_matches(split, s1_code, t_code, chosen, name=name)
     log(f'{int(chosen.sum()):,} matches ({choice["method"]}, shift {param:+.2f}) -> {path}')
 
 
@@ -548,6 +567,8 @@ def main():
     mode.add_argument('--predict', action='store_true')
     mode.add_argument('--redecode', action='store_true',
                       help='re-decode saved --predict probabilities with --shift (minutes, no model run)')
+    ap.add_argument('--unseen-shift', type=float, default=None,
+                    help='with --redecode: extra logit shift for Source 1 in countries unseen in training (negative = stricter)')
     ap.add_argument('--shift', type=float, default=None,
                     help='override the logit shift for expected-F decoding at predict time (negative = stricter)')
     args = ap.parse_args()
@@ -556,7 +577,7 @@ def main():
     elif args.fit:
         run_fit(args.split, stage2_only=args.stage2_only)
     elif args.redecode:
-        run_redecode(args.split, args.shift)
+        run_redecode(args.split, args.shift, args.unseen_shift)
     else:
         run_predict(args.split, args.shift)
 
